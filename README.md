@@ -28,6 +28,12 @@ flowchart LR
    curl -F "file=@course.pdf" http://localhost:8000/api/v1/documents
    ```
 
+### Deploying with `learning_studio` as the Vercel Root Directory
+
+Set Vercel's **Root Directory** to `learning_studio`. That folder contains its own
+`vercel.json`, `requirements.txt`, and `api/index.py` entrypoint. The entrypoint exposes
+the FastAPI application while preserving package-relative imports.
+
 Endpoints include `GET /health`, `GET /api/v1/search?q=...`, and `GET /api/v1/graph`.
 
 The structured study experience uses:
