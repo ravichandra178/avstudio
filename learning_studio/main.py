@@ -1,8 +1,9 @@
-import uuid
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from contextlib import asynccontextmanager
+import json
 import logging
 from pathlib import Path
+import uuid
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
@@ -40,6 +41,7 @@ from .prompts import (
     learning_plan_prompt,
     question_prompt,
 )
+from magnum import Magnum
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
@@ -58,7 +60,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="Learning Studio", version="0.1.0", lifespan=lifespan)
 FRONTEND_DIR = Path(__file__).parent / "frontend"
 app.mount("/frontend", StaticFiles(directory=FRONTEND_DIR), name="frontend")
-
+handler = Magnum(app, settings=settings, logger=logger)
 
 @app.get("/", include_in_schema=False)
 def frontend() -> FileResponse:
@@ -166,7 +168,122 @@ def learning_plan(session_id: str, request: LearningPlanRequest) -> LearningPlan
         session_context = graph.session_context(session_id)
         if not session_context:
             raise HTTPException(status_code=404, detail="Study session not found")
-        topic = (request.topic or "").strip()
+        textbook = session_context["textbook"]
+        raw_topic = (request.topic or "").strip()
+
+        # Step 1: Zero-lag fetch for selected entity question from Neo4j
+        db_question = None
+        source_mode = "selected_entity"
+        if raw_topic:
+            db_question = graph.entity_question(session_id, textbook, raw_topic)
+
+        # Step 2: Fallback 1 / Next Question - Fetch closest related question from database
+        if not db_question:
+            anchor = raw_topic or graph.last_screening_entity(session_id)
+            db_question = graph.related_learning_question(session_id, textbook, anchor)
+            if db_question:
+                source_mode = "related_entity" if anchor else "textbook_bank"
+
+        # If found in database: return immediately with zero lag
+        if db_question:
+            q_text = str(db_question.get("question") or "").strip()
+            raw_options = db_question.get("options") or []
+            if isinstance(raw_options, str):
+                raw_options = raw_options.strip()
+                if raw_options.startswith("[") and raw_options.endswith("]"):
+                    try:
+                        parsed = json.loads(raw_options)
+                        raw_options = parsed if isinstance(parsed, list) else [raw_options]
+                    except Exception:
+                        raw_options = [opt.strip() for opt in raw_options.split(",") if opt.strip()]
+                else:
+                    raw_options = [opt.strip() for opt in raw_options.split(",") if opt.strip()]
+            elif not isinstance(raw_options, (list, tuple, set)):
+                raw_options = []
+
+            options = [str(opt).strip() for opt in raw_options if opt is not None and str(opt).strip()]
+
+            # Only use db_question if it has valid question text and at least 2 options
+            if q_text and len(options) >= 2:
+                entity_name = db_question.get("entity_name") or raw_topic or textbook
+                correct_option = db_question.get("correct_option")
+                if correct_option is None or not isinstance(correct_option, int) or not (0 <= correct_option < len(options)):
+                    answer = str(db_question.get("answer") or "").strip()
+                    matched_idx = next(
+                        (i for i, opt in enumerate(options) if opt and opt.lower() in answer.lower()),
+                        0,
+                    )
+                    correct_option = matched_idx
+
+                explanation = str(db_question.get("explanation") or db_question.get("answer") or "").strip()
+                citations = db_question.get("citations")
+                if not isinstance(citations, list):
+                    citations = []
+
+                # Retrieve textbook passages for the entity
+                passages = graph.textbook_passages(textbook, topic=entity_name, limit=2)
+                if not passages and raw_topic and raw_topic != entity_name:
+                    passages = graph.textbook_passages(textbook, topic=raw_topic, limit=2)
+
+                if passages:
+                    etext = passages[0]["text"]
+                    summary = f"Key concept: {entity_name}. Review the passage above and answer the question below."
+                else:
+                    etext = f"{entity_name}: {explanation}" if explanation else f"Review key exam topic: {entity_name}."
+                    summary = f"Key exam topic: {entity_name}. Review the concept facts and test your understanding below."
+
+                # Persist screening question to session and mark as asked
+                screening_question_id = str(uuid.uuid4())
+                graph.save_learning_question(
+                    screening_question_id,
+                    session_id,
+                    entity_name,
+                    request.mode,
+                    q_text,
+                    options,
+                    correct_option,
+                    explanation,
+                    settings.question_level,
+                    textbook,
+                    entity_name=entity_name,
+                    study_question_id=db_question.get("question_id"),
+                )
+                if db_question.get("question_id"):
+                    graph.mark_question_asked(session_id, db_question["question_id"])
+
+                logger.info(
+                    "LEARNING_QUESTION_ZERO_LAG session=%s source=%s entity=%s question_id=%s",
+                    session_id,
+                    source_mode,
+                    entity_name,
+                    db_question.get("question_id"),
+                )
+
+                return LearningPlanResponse(
+                    session_id=session_id,
+                    mode=request.mode,
+                    topic=entity_name,
+                    etext=etext,
+                    summary=summary,
+                    question=ScreeningQuestion(
+                        question_id=screening_question_id,
+                        question=q_text,
+                        options=options,
+                    ),
+                    citations=citations,
+                    source="textbook",
+                )
+            else:
+                logger.warning(
+                    "LEARNING_QUESTION_INVALID session=%s question_id=%s raw_options=%r; falling back to LLM",
+                    session_id,
+                    db_question.get("question_id"),
+                    db_question.get("options"),
+                )
+
+        # Step 3: Fallback 2 - Use LLM when no questions found in Neo4j
+        logger.info("LEARNING_QUESTION_FALLBACK_LLM session=%s topic=%s", session_id, raw_topic)
+        topic = raw_topic
         citations = (
             graph.search(topic, limit=8, textbook=session_context["textbook"])
             if topic
@@ -268,6 +385,7 @@ def learning_plan(session_id: str, request: LearningPlanRequest) -> LearningPlan
             str(generated.get("explanation", "")),
             settings.question_level,
             session_context["textbook"],
+            entity_name=request.topic,
         )
         return LearningPlanResponse(
             session_id=session_id,

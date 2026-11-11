@@ -454,6 +454,195 @@ class KnowledgeGraph:
             ).single()
             return bool(result["liked"]) if result else False
 
+    def last_screening_entity(self, session_id: str) -> str | None:
+        with self.session() as session:
+            result = session.run(
+                """
+                MATCH (s:StudySession {id: $session_id})-[:HAS_SCREENING_QUESTION]->(q:ScreeningQuestion)
+                RETURN coalesce(q.entity_name, q.topic) AS entity_name
+                ORDER BY q.created_at DESC
+                LIMIT 1
+                """,
+                session_id=session_id,
+            ).single()
+            if result and result["entity_name"]:
+                return str(result["entity_name"]).strip()
+            return None
+
+    @staticmethod
+    def _sanitize_question_dict(item: dict | None, default_entity: str = "") -> dict | None:
+        if not isinstance(item, dict):
+            return None
+        q_text = str(item.get("question") or "").strip()
+        if not q_text:
+            return None
+        raw_options = item.get("options") or []
+        if isinstance(raw_options, str):
+            raw_options = raw_options.strip()
+            if raw_options.startswith("[") and raw_options.endswith("]"):
+                try:
+                    parsed = json.loads(raw_options)
+                    raw_options = parsed if isinstance(parsed, list) else [raw_options]
+                except Exception:
+                    raw_options = [opt.strip() for opt in raw_options.split(",") if opt.strip()]
+            else:
+                raw_options = [opt.strip() for opt in raw_options.split(",") if opt.strip()]
+        elif not isinstance(raw_options, (list, tuple, set)):
+            return None
+        options = [str(opt).strip() for opt in raw_options if opt is not None and str(opt).strip()]
+        if len(options) < 2:
+            return None
+
+        correct_option = item.get("correct_option")
+        if correct_option is None or not isinstance(correct_option, int) or not (0 <= correct_option < len(options)):
+            answer = str(item.get("answer") or "").strip()
+            matched_idx = next(
+                (i for i, opt in enumerate(options) if opt and opt.lower() in answer.lower()),
+                0,
+            )
+            correct_option = matched_idx
+
+        citations = item.get("citations") or []
+        if isinstance(citations, str):
+            try:
+                citations = json.loads(citations)
+            except Exception:
+                citations = []
+        if not isinstance(citations, list):
+            citations = []
+
+        return {
+            "question_id": item.get("question_id"),
+            "question": q_text,
+            "options": options,
+            "correct_option": correct_option,
+            "answer": str(item.get("answer") or "").strip(),
+            "explanation": str(item.get("explanation") or item.get("answer") or "").strip(),
+            "citations": citations,
+            "entity_name": item.get("entity_name") or default_entity,
+            "entity_type": item.get("entity_type"),
+            "liked": bool(item.get("liked", False)),
+        }
+
+    def entity_question(self, session_id: str, textbook: str, entity_name: str) -> dict | None:
+        entity_name = (entity_name or "").strip()
+        if not entity_name:
+            return None
+        with self.session() as session:
+            result = session.run(
+                """
+                MATCH (s:StudySession {id: $session_id})
+                OPTIONAL MATCH (s)-[:HAS_SCREENING_QUESTION]->(sq:ScreeningQuestion)
+                OPTIONAL MATCH (s)-[:ASKED]->(aq:StudyQuestion)
+                WITH s,
+                     collect(DISTINCT sq.question) + collect(DISTINCT aq.question) AS asked_questions,
+                     collect(DISTINCT sq.study_question_id) + collect(DISTINCT aq.id) AS asked_ids
+
+                MATCH (q:StudyQuestion)
+                WHERE (q.textbook = $textbook OR q.textbook IS NULL)
+                  AND q.question IS NOT NULL AND trim(q.question) <> ''
+                  AND q.options IS NOT NULL
+                  AND (
+                      toLower(coalesce(q.entity_name, '')) = toLower($entity_name)
+                      OR (
+                          size($entity_name) >= 3
+                          AND (
+                              toLower(coalesce(q.entity_name, '')) CONTAINS toLower($entity_name)
+                              OR toLower($entity_name) CONTAINS toLower(coalesce(q.entity_name, ''))
+                          )
+                      )
+                  )
+                  AND NOT q.question IN asked_questions
+                  AND NOT q.id IN asked_ids
+                RETURN q.id AS question_id, q.question AS question, q.options AS options,
+                       q.correct_option AS correct_option, q.answer AS answer,
+                       q.explanation AS explanation, q.citations AS citations,
+                       coalesce(q.entity_name, $entity_name) AS entity_name,
+                       q.entity_type AS entity_type,
+                       coalesce(q.liked, false) AS liked
+                ORDER BY
+                    CASE WHEN toLower(coalesce(q.entity_name, '')) = toLower($entity_name) THEN 0 ELSE 1 END,
+                    coalesce(q.created_at, datetime()) DESC
+                LIMIT 1
+                """,
+                session_id=session_id,
+                textbook=textbook,
+                entity_name=entity_name,
+            ).single()
+            if not result:
+                return None
+            return self._sanitize_question_dict(result.data(), default_entity=entity_name)
+
+    def related_learning_question(
+        self, session_id: str, textbook: str, anchor_entity: str | None = None
+    ) -> dict | None:
+        anchor_entity = (anchor_entity or "").strip()
+        with self.session() as session:
+            result = session.run(
+                """
+                MATCH (s:StudySession {id: $session_id})
+                OPTIONAL MATCH (s)-[:HAS_SCREENING_QUESTION]->(sq:ScreeningQuestion)
+                OPTIONAL MATCH (s)-[:ASKED]->(aq:StudyQuestion)
+                WITH s,
+                     collect(DISTINCT sq.question) + collect(DISTINCT aq.question) AS asked_questions,
+                     collect(DISTINCT sq.study_question_id) + collect(DISTINCT aq.id) AS asked_ids
+
+                // Find directly connected entities in the knowledge graph
+                OPTIONAL MATCH (e)-[r]-(related)
+                WHERE $anchor_entity <> '' AND (
+                    toLower(coalesce(e.name, e.title, e.text, e.id, '')) = toLower($anchor_entity)
+                    OR (
+                        size($anchor_entity) >= 3 AND
+                        toLower(coalesce(e.name, e.title, e.text, e.id, '')) CONTAINS toLower($anchor_entity)
+                    )
+                )
+                AND NOT any(l IN labels(related) WHERE l IN [
+                    'StudyGroup', 'Textbook', 'Document', 'Chunk', 'StudySession', 'StudyMessage'
+                ])
+                WITH s, asked_questions, asked_ids,
+                     collect(DISTINCT toLower(coalesce(related.name, related.title, related.text, related.id, ''))) AS direct_related
+
+                MATCH (q:StudyQuestion)
+                WHERE (q.textbook = $textbook OR q.textbook IS NULL)
+                  AND q.question IS NOT NULL AND trim(q.question) <> ''
+                  AND q.options IS NOT NULL
+                  AND NOT q.question IN asked_questions
+                  AND NOT q.id IN asked_ids
+                RETURN q.id AS question_id, q.question AS question, q.options AS options,
+                       q.correct_option AS correct_option, q.answer AS answer,
+                       q.explanation AS explanation, q.citations AS citations,
+                       q.entity_name AS entity_name, q.entity_type AS entity_type,
+                       coalesce(q.liked, false) AS liked,
+                       CASE
+                           WHEN toLower(coalesce(q.entity_name, '')) IN direct_related THEN 1
+                           WHEN $anchor_entity <> '' AND toLower(coalesce(q.citations, '')) CONTAINS toLower($anchor_entity) THEN 2
+                           WHEN $anchor_entity <> '' AND toLower(coalesce(q.question, '')) CONTAINS toLower($anchor_entity) THEN 3
+                           ELSE 4
+                       END AS score
+                ORDER BY score ASC, coalesce(q.created_at, datetime()) DESC
+                LIMIT 1
+                """,
+                session_id=session_id,
+                textbook=textbook,
+                anchor_entity=anchor_entity,
+            ).single()
+            if not result:
+                return None
+            return self._sanitize_question_dict(result.data(), default_entity=anchor_entity)
+
+    def mark_question_asked(self, session_id: str, question_id: str) -> None:
+        with self.session() as session:
+            session.run(
+                """
+                MATCH (s:StudySession {id: $session_id})
+                MATCH (q:StudyQuestion {id: $question_id})
+                MERGE (s)-[:ASKED]->(q)
+                SET q.asked_at = datetime()
+                """,
+                session_id=session_id,
+                question_id=question_id,
+            ).consume()
+
     def save_learning_question(
         self,
         question_id: str,
@@ -466,6 +655,8 @@ class KnowledgeGraph:
         explanation: str,
         level: str,
         textbook: str,
+        entity_name: str | None = None,
+        study_question_id: str | None = None,
     ) -> None:
         with self.session() as session:
             session.run(
@@ -473,6 +664,8 @@ class KnowledgeGraph:
                 MATCH (s:StudySession {id: $session_id})
                 CREATE (q:ScreeningQuestion {
                     id: $question_id, topic: $topic, mode: $mode,
+                    entity_name: coalesce($entity_name, $topic),
+                    study_question_id: $study_question_id,
                     question: $question, options: $options,
                     correct_option: $correct_option, explanation: $explanation,
                     level: $level, textbook: $textbook,
@@ -484,6 +677,8 @@ class KnowledgeGraph:
                 question_id=question_id,
                 topic=topic,
                 mode=mode,
+                entity_name=entity_name,
+                study_question_id=study_question_id,
                 question=question,
                 options=options,
                 correct_option=correct_option,

@@ -5,4 +5,5 @@ __pycache__/
 .ingested_pdfs.tmp
 .venv
 *snowflake.yml
-
+.pytest_cache/
+my_pdfs/
