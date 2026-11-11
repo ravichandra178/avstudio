@@ -75,8 +75,8 @@ langchain-text-splitters==0.3.11
 langsmith==0.14.17
 lazy-importer==0.1.0
 legacy-cgi==2.6.4
-magnum==23.0.0
 Mako==1.4.3
+mangum==0.22.0
 markdown-it-py==4.3.0
 MarkupSafe==3.0.4
 marshmallow==3.26.2
