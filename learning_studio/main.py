@@ -41,7 +41,6 @@ from .prompts import (
     learning_plan_prompt,
     question_prompt,
 )
-from mangum import Mangum
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
@@ -60,7 +59,13 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="Learning Studio", version="0.1.0", lifespan=lifespan)
 FRONTEND_DIR = Path(__file__).parent / "frontend"
 app.mount("/frontend", StaticFiles(directory=FRONTEND_DIR), name="frontend")
-handler = Mangum(app)
+
+try:
+    from mangum import Mangum
+
+    handler = Mangum(app)
+except ImportError:
+    handler = app
 
 @app.get("/", include_in_schema=False)
 def frontend() -> FileResponse:
