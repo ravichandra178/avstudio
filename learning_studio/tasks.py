@@ -1,20 +1,46 @@
 import io
 import logging
 
-from celery import Celery
 from pypdf import PdfReader
 
-from .ai import AIProvider
-from .ai import AIExtractionError
+from .ai import AIExtractionError, AIProvider
 from .config import get_settings
 from .graph import KnowledgeGraph
 from .storage import DocumentStorage
 
-celery = Celery("learning_studio", broker=get_settings().redis_url, backend=get_settings().redis_url)
 logger = logging.getLogger(__name__)
 
+try:
+    from celery import Celery
 
-@celery.task
+    celery = Celery(
+        "learning_studio",
+        broker=get_settings().redis_url,
+        backend=get_settings().redis_url,
+    )
+    task_decorator = celery.task
+except ImportError:
+    celery = None
+
+    def task_decorator(func):
+        class _TaskWrapper:
+            def __init__(self, fn):
+                self.fn = fn
+
+            def delay(self, *args, **kwargs):
+                logger.warning(
+                    "Celery is not installed. Task '%s' was invoked via delay in fallback mode.",
+                    self.fn.__name__,
+                )
+                return None
+
+            def __call__(self, *args, **kwargs):
+                return self.fn(*args, **kwargs)
+
+        return _TaskWrapper(func)
+
+
+@task_decorator
 def ingest_document(document_id: str, filename: str, storage_key: str) -> None:
     settings = get_settings()
     storage = DocumentStorage(settings)

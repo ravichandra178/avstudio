@@ -103,7 +103,10 @@ async def upload_document(file: UploadFile = File(...)) -> UploadResponse:  # no
         raise HTTPException(status_code=413, detail="PDF exceeds the upload size limit")
     document_id = str(uuid.uuid4())
     key = DocumentStorage(settings).put(document_id, file.filename or "document.pdf", content)
-    ingest_document.delay(document_id, file.filename or "document.pdf", key)
+    try:
+        ingest_document.delay(document_id, file.filename or "document.pdf", key)
+    except Exception as exc:
+        logger.warning("Background task queueing failed: %s", exc)
     return UploadResponse(document_id=document_id, status="queued")
 
 
