@@ -114,18 +114,23 @@ def entity_question_ingestion_prompt(
         "CRITICAL FORMAT RULE: If writing a statement-based question, put numbered statements (1, 2, 3) in the 'question' text itself, and make the 4 options combinations like '1 and 2 only', '2 and 3 only', or 'All of the above'. Do NOT put raw descriptive sentences as options unless it is a standard single-fact MCQ."
     )
 
-def chat_prompt(message: str, language: str, passages: str = "", entity: str = "") -> str:
+def chat_prompt(message: str, language: str, passages: str = "", entity: str = "", textbook: str = "") -> str:
+    tb_note = f"Primary Textbook: {textbook}\n" if textbook else ""
     focus_note = f"Focus Topic / Entity: {entity}\n" if entity else ""
     return (
-        "You are an expert civil services exam study tutor. "
-        "Answer the learner's question using the supplied textbook context and knowledge graph facts from Neo4j. "
+        "You are an intelligent, context-aware civil services study tutor. "
+        "You possess deep textbook knowledge grounded in the courseware, as well as comprehensive real-world and internet awareness.\n"
         f"Respond in {language}.\n"
+        f"{tb_note}"
         f"{focus_note}"
-        "CRITICAL FORMAT RULES:\n"
+        "AWARENESS & SCOPE GUIDELINES:\n"
+        "1. Textbook-Aware: When queries ask about the textbook, chapters, or syllabus entities, strictly prioritize the verified facts and passages supplied below.\n"
+        "2. Internet & Outside-World Aware: When the user asks for contemporary context, current affairs, global comparisons, or topics not in the textbook, draw upon up-to-date real-world knowledge to give a comprehensive, accurate answer.\n"
+        "FORMAT RULES:\n"
         "1. Provide a fast, high-yield summary in EXACTLY TWO PARAGRAPHS.\n"
-        "2. Paragraph 1: Define the core concept or entity, its primary role, and textbook background.\n"
-        "3. Paragraph 2: Detail key relationships, connected institutions, specific facts, and exam relevance.\n"
-        "4. Maximum 60 words per paragraph. Do NOT use bullet points, markdown headings, or numbering.\n\n"
+        "2. Paragraph 1: Define the core concept or answer the primary question clearly with foundational context.\n"
+        "3. Paragraph 2: Detail key relationships, real-world connections, institutional roles, and civil services exam relevance.\n"
+        "4. Keep each paragraph concise (under 75 words). Do NOT use bullet points, markdown headings, or numbering.\n\n"
         f"--- TEXTBOOK CONTEXT FROM NEO4J ---\n{passages}\n-----------------------------------\n\n"
         f"Learner question: {message}"
     )

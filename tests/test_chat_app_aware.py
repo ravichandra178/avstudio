@@ -52,3 +52,55 @@ def test_chat_change_question_and_app_aware_response():
         assert resp2.status_code == 200
         paragraphs = resp2.json()["answer"].strip().split("\n\n")
         assert len(paragraphs) == 2
+
+
+def test_screening_answer_hidden_until_two_incorrect_attempts():
+    client = TestClient(app)
+    with patch("learning_studio.main.KnowledgeGraph") as mock_kg_class:
+        mock_kg = MagicMock()
+        mock_kg_class.return_value = mock_kg
+
+        # First incorrect attempt
+        mock_kg.screening_question.return_value = {
+            "question": "What is ISRO?",
+            "options": ["Agency", "Club"],
+            "correct_option": 0,
+            "explanation": "ISRO is India space agency.",
+            "attempts_used": 0,
+            "resolved": False,
+        }
+        mock_kg.record_screening_attempt.return_value = {
+            "question": "What is ISRO?",
+            "options": ["Agency", "Club"],
+            "correct_option": 0,
+            "explanation": "ISRO is India space agency.",
+            "attempts_used": 1,
+            "resolved": False,
+        }
+        resp1 = client.post("/api/v1/sessions/test-session/screening/q1/attempt", json={"option_index": 1})
+        assert resp1.status_code == 200
+        data1 = resp1.json()
+        assert data1["correct"] is False
+        assert data1["answer_revealed"] is False
+        assert data1["correct_option_index"] is None
+        assert data1["attempts_remaining"] == 1
+        assert "1 attempt remaining" in data1["feedback"]
+
+        # Second incorrect attempt -> answer is revealed!
+        mock_kg.screening_question.return_value["attempts_used"] = 1
+        mock_kg.record_screening_attempt.return_value = {
+            "question": "What is ISRO?",
+            "options": ["Agency", "Club"],
+            "correct_option": 0,
+            "explanation": "ISRO is India space agency.",
+            "attempts_used": 2,
+            "resolved": True,
+        }
+        resp2 = client.post("/api/v1/sessions/test-session/screening/q1/attempt", json={"option_index": 1})
+        assert resp2.status_code == 200
+        data2 = resp2.json()
+        assert data2["correct"] is False
+        assert data2["answer_revealed"] is True
+        assert data2["correct_option_index"] == 0
+        assert data2["attempts_remaining"] == 0
+        assert "Two incorrect attempts" in data2["feedback"]

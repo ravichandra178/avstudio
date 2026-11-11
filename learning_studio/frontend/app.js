@@ -205,7 +205,7 @@ async function startLearningFlow() {
   $("#lesson-summary").textContent = plan.summary;
   $("#screening-question").textContent = plan.question.question;
   $("#screening-options").innerHTML = plan.question.options.map((option, index) => `<button type="button" data-option="${index}">${option}</button>`).join("");
-  $("#attempts").textContent = "Three attempts allowed before the next question.";
+  $("#attempts").textContent = "Two attempts allowed before the answer is revealed.";
   $("#next-question-status").classList.add("hidden");
   $("#screening-feedback").classList.add("hidden");
   $("#lesson").classList.remove("hidden");

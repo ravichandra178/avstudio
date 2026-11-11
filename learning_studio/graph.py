@@ -708,7 +708,7 @@ class KnowledgeGraph:
                 MATCH (s:StudySession {id: $session_id})-[:HAS_SCREENING_QUESTION]->(q:ScreeningQuestion {id: $question_id})
                 WHERE coalesce(q.resolved, false) = false
                 SET q.attempts_used = q.attempts_used + 1
-                SET q.resolved = ($option_index = q.correct_option OR q.attempts_used >= 3)
+                SET q.resolved = ($option_index = q.correct_option OR q.attempts_used >= 2)
                 RETURN q { .* }
                 """,
                 session_id=session_id,

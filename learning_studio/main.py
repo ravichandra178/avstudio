@@ -430,7 +430,7 @@ def screening_attempt(
         if request.option_index >= len(options):
             raise HTTPException(status_code=400, detail="Invalid option index")
         attempts_used = int(question["attempts_used"])
-        if attempts_used >= 3 or question.get("resolved", False):
+        if attempts_used >= 2 or question.get("resolved", False):
             is_correct = request.option_index == int(question["correct_option"])
             return ScreeningAttemptResponse(
                 correct=is_correct,
@@ -446,14 +446,20 @@ def screening_attempt(
             raise HTTPException(status_code=409, detail="Screening question is already resolved")
         is_correct = request.option_index == int(question["correct_option"])
         attempts_used = int(question["attempts_used"])
-        revealed = is_correct or attempts_used >= 3
-        feedback = "Correct. Nice work." if is_correct else "Not quite. Review the explanation and try again."
-        if revealed and not is_correct:
-            feedback = str(question["explanation"])
+        revealed = is_correct or attempts_used >= 2
+        if is_correct:
+            feedback = "Correct! Great job."
+        elif revealed:
+            correct_letter = chr(65 + int(question["correct_option"]))
+            explanation = str(question.get("explanation", "")).strip()
+            feedback = f"Two incorrect attempts. The correct answer was Option {correct_letter}. {explanation}"
+        else:
+            feedback = "Incorrect. Try again (1 attempt remaining)."
+
         return ScreeningAttemptResponse(
             correct=is_correct,
             attempts_used=attempts_used,
-            attempts_remaining=max(0, 3 - attempts_used),
+            attempts_remaining=max(0, 2 - attempts_used),
             answer_revealed=revealed,
             correct_option_index=int(question["correct_option"]) if revealed else None,
             feedback=feedback,
@@ -466,11 +472,12 @@ def screening_attempt(
 def extract_entity_from_chat(message: str, fallback_topic: str | None = None) -> str:
     cleaned = message.strip()
     patterns = [
+        r"^ask\s+from\s+(?:the\s+)?textbook\s+(?:about|on)\s*[:\-]?\s*\[?([^\]\?\.\n]+)\]?",
         r"^ask\s+from\s*[:\-]?\s*\[?([^\]\?\.\n]+)\]?",
         r"^ask\s+about\s*[:\-]?\s*\[?([^\]\?\.\n]+)\]?",
         r"^tell\s+me\s+about\s*[:\-]?\s*\[?([^\]\?\.\n]+)\]?",
         r"^summarize\s*[:\-]?\s*\[?([^\]\?\.\n]+)\]?",
-        r"^what\s+is\s*[:\-]?\s*\[?([^\]\?\.\n]+)\]?",
+        r"^what\s+(?:does\s+the\s+textbook\s+say\s+about|is)\s*[:\-]?\s*\[?([^\]\?\.\n]+)\]?",
         r"^explain\s*[:\-]?\s*\[?([^\]\?\.\n]+)\]?",
     ]
     for pat in patterns:
@@ -491,7 +498,7 @@ def synthesize_fast_two_paragraphs(
 ) -> str:
     display_topic = topic or "This subject"
 
-    # Paragraph 1: Definition and overview from passages, citations, or evidence
+    # Paragraph 1: Definition and overview from passages, citations, or broader context
     p1 = ""
     if passages:
         raw = passages[0]["text"].replace("\n", " ").strip()
@@ -500,18 +507,18 @@ def synthesize_fast_two_paragraphs(
         if not p1.endswith("."):
             p1 += "."
     elif citations and citations[0].get("description"):
-        p1 = f"{display_topic} is an essential concept in {textbook}. {citations[0]['description']}".strip()
+        p1 = f"{display_topic} is an essential concept documented in {textbook}. {citations[0]['description']}".strip()
     elif evidence:
         p1 = f"{display_topic} is categorized as a {evidence[0]['entity_type']} in {textbook}, playing an integral role in the study curriculum."
     else:
-        p1 = f"{display_topic} represents a key conceptual topic covered in {textbook} for competitive examinations."
+        p1 = f"{display_topic} is a significant subject of study for competitive examinations, reflecting fundamental principles, contemporary developments, and public administration impacts."
 
-    # Paragraph 2: Relationships, connected entities, and exam relevance
+    # Paragraph 2: Relationships, connected entities, real-world context, and exam relevance
     p2 = ""
     if evidence:
         rels = [f"{e['relationship']} {e['entity_name']}" for e in evidence[:4] if e.get("entity_name")]
         if rels:
-            p2 = f"In the knowledge graph, {display_topic} is linked with {', '.join(rels)}. Understanding these core linkages and structural interactions is vital for analytical exam questions."
+            p2 = f"In the knowledge graph, {display_topic} connects directly with {', '.join(rels)}. Understanding these core linkages and institutional interactions is vital for analytical exam questions."
     if not p2:
         if len(passages) > 1:
             raw2 = passages[1]["text"].replace("\n", " ").strip()
@@ -520,7 +527,7 @@ def synthesize_fast_two_paragraphs(
             if not p2.endswith("."):
                 p2 += "."
         else:
-            p2 = f"Detailed analysis of {display_topic} reinforces conceptual clarity and contextual recall across related chapters in {textbook}."
+            p2 = f"Beyond foundational textbook coverage, exploring {display_topic} across contemporary real-world developments and administrative policies equips students with comprehensive analytical depth."
 
     return f"{p1}\n\n{p2}"
 
@@ -593,6 +600,7 @@ def chat(session_id: str, request: ChatRequest) -> ChatResponse:
             "Telugu" if request.language == "te" else "English",
             passages=ground_context,
             entity=entity_name or active_topic,
+            textbook=textbook,
         )
 
         context_blocks = [
