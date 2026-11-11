@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Learning Studio</title>
+    <link rel="stylesheet" href="/frontend/styles.css" />
+  </head>
+  <body>
+    <div class="setup-overlay" id="setup-overlay">
+      <form class="setup-card" id="setup-form">
+        <div class="brand-mark">L</div>
+        <span class="eyebrow">WELCOME TO LEARNING STUDIO</span>
+        <h1>Set up your study space</h1>
+        <p>Choose your group and textbook. The tutor will use your library first, then Gemini when your graph has no answer.</p>
+        <label>Group<select id="group-select"></select></label>
+        <label>Textbook<select id="textbook-select"></select></label>
+        <button class="setup-submit" id="setup-submit" type="submit" disabled>Start learning <span>→</span></button>
+      </form>
+    </div>
+    <div class="flow-overlay hidden" id="flow-overlay">
+      <form class="flow-card" id="flow-form">
+        <span class="eyebrow">YOUR NEXT STEP</span>
+        <p class="selected-textbook" id="selected-textbook"></p>
+        <h1>How do you want to learn?</h1>
+        <div class="flow-modes"><button type="button" class="flow-mode active-flow" data-flow="guided"><strong>Guided study</strong><span>Build from fundamentals with a recommended sequence.</span></button><button type="button" class="flow-mode" data-flow="topic_focused"><strong>Topic focused</strong><span>Jump straight into one topic you choose.</span></button></div>
+        <label>Choose a topic<input id="flow-topic" placeholder="Choose a suggestion or continue without one" /></label>
+        <div class="topic-suggestions" id="topic-suggestions"></div>
+        <p class="flow-status" id="flow-status">Suggestions are taken from the selected textbook. You can choose one or continue with the textbook overview.</p>
+        <button class="setup-submit" type="submit">Start this lesson <span>→</span></button>
+      </form>
+    </div>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">L</div>
+          <div><strong>Learning Studio</strong><span>your thinking space</span></div>
+        </div>
+        <button class="new-space" id="new-session"><span>＋</span> New study space</button>
+        <nav class="nav">
+          <a class="active" href="#chat"><span>✦</span> AI tutor</a>
+          <a href="#questions"><span>▣</span> Question player</a>
+          <a href="#library"><span>▤</span> My library</a>
+          <a href="#graph"><span>◌</span> Knowledge graph</a>
+        </nav>
+        <div class="sidebar-label">Recent spaces</div>
+        <div class="recent-list">
+          <div id="recent-list"></div>
+        </div>
+        <div class="sidebar-bottom">
+          <button class="icon-button">⚙ <span>Settings</span></button>
+          <div class="profile"><div class="avatar">RC</div><div><strong>Ravi Chandra</strong><span>Personal workspace</span></div><b>•••</b></div>
+        </div>
+      </aside>
+
+      <main class="main-content">
+        <header class="topbar">
+          <div class="breadcrumbs"><span>My library</span><b>›</b><strong id="breadcrumb-text">Select a textbook</strong></div>
+          <div class="top-actions"><button class="mobile-menu" id="mobile-menu" type="button" aria-label="Open navigation">☰</button><button class="language-switch" id="language-switch" type="button" aria-label="Switch language"><span class="lang-en active-lang">EN</span><span class="lang-te">తె</span></button><button class="plain-button">Share</button><button class="more">•••</button></div>
+        </header>
+        <section class="workspace">
+          <div class="welcome">
+            <div class="eyebrow"><span class="spark">✦</span> AI TUTOR</div>
+            <h1>What are you working<br />on today?</h1>
+            <p>Ask questions, explore your documents, or let me quiz you on what you know.</p>
+            <div class="source-row"><span class="source-icon">PDF</span><span id="source-text">No textbook selected</span><span class="status" id="source-status"></span></div>
+          </div>
+
+          <div class="lesson hidden" id="lesson">
+            <div class="lesson-kicker">LEARNING STEP <span class="lesson-source" id="lesson-source"></span></div><h2 id="lesson-topic"></h2><div class="lesson-etext" id="lesson-etext"></div><div class="lesson-summary"><strong>In short</strong><p id="lesson-summary"></p></div>
+            <div class="screening-card"><span class="eyebrow">KNOWLEDGE CHECK</span><h3 id="screening-question"></h3><div id="screening-options" class="screening-options"></div><p class="attempts" id="attempts"></p><p class="next-question-status hidden" id="next-question-status"></p><div class="feedback hidden" id="screening-feedback"></div></div>
+          </div>
+          <div class="chat" id="chat">
+            <div class="message assistant">
+              <div class="message-avatar">✦</div>
+              <div class="message-body">
+                <div class="message-meta"><strong data-copy="studio">Studio</strong><span>just now</span></div>
+                <p id="welcome-text"></p>
+                <div class="suggestions" id="suggestions"></div>
+              </div>
+            </div>
+            <div class="message user hidden" id="user-message">
+              <div class="message-avatar user-avatar">RC</div>
+              <div class="message-body"><div class="message-meta"><strong>You</strong><span>now</span></div><p id="user-text"></p></div>
+            </div>
+            <div class="message assistant hidden" id="assistant-message">
+              <div class="message-avatar">✦</div>
+              <div class="message-body"><div class="message-meta"><strong>Studio</strong><span>now</span></div><p id="assistant-text"></p><div class="citation hidden" id="citation"></div></div>
+            </div>
+          </div>
+
+          <div class="composer-wrap">
+            <form class="composer" id="chat-form"><textarea id="chat-input" rows="1" placeholder="Ask anything about your study material..."></textarea><div class="composer-footer"><span class="hint">↵ to send · shift + ↵ for new line</span><div><button type="button" class="attach">⌕</button><button class="send" type="submit">↑</button></div></div></form>
+            <div class="composer-note">Studio answers from your sources and shows its working.</div>
+          </div>
+        </section>
+
+        <aside class="right-panel" id="right-panel">
+          <div class="panel-header"><div><span class="eyebrow">STUDY TOOLS</span><h2>Make it stick</h2></div><button class="close-panel">×</button></div>
+          <div class="tool-card featured" id="questions"><div class="tool-icon purple-bg">✦</div><div><strong>Question player</strong><p>Turn this chapter into active recall.</p><div class="tool-actions"><button data-mode="textbook">From textbook <span>→</span></button><button data-mode="previous">Previous questions <span>→</span></button><button data-mode="repeated">Repeat what I missed <span>→</span></button></div></div></div>
+          <div class="tool-card" id="library"><div class="tool-icon yellow-bg">▤</div><div><strong>Study progress</strong><p id="progress-label">Keep exploring your material</p><div class="progress"><span id="progress-bar"></span></div><small id="progress-percent">0% explored</small></div></div>
+          <div class="tool-card" id="graph"><div class="tool-icon blue-bg">◌</div><div><strong>Knowledge graph</strong><p>See how ideas connect.</p><button class="outline-button" id="open-graph">Open graph <span>→</span></button></div></div>
+          <div class="focus-card"><span class="eyebrow">TODAY'S FOCUS</span><p>“The goal of learning is not to memorize, but to understand the relationships.”</p><small>Based on your recent questions</small></div>
+        </aside>
+      </main>
+    </div>
+    <div class="toast" id="toast"></div>
+    <script src="/frontend/app.js"></script>
+  </body>
+</html>

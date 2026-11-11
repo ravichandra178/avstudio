@@ -1,0 +1,25 @@
+services:
+  api:
+    build: .
+    env_file: .env
+    ports:
+      - "8000:8000"
+    depends_on:
+      - redis
+      - neo4j
+  worker:
+    build: .
+    command: celery -A learning_studio.tasks.celery worker --loglevel=INFO
+    env_file: .env
+    depends_on:
+      - redis
+      - neo4j
+  redis:
+    image: redis:7-alpine
+  neo4j:
+    image: neo4j:5
+    environment:
+      NEO4J_AUTH: neo4j/change-me
+    ports:
+      - "7474:7474"
+      - "7687:7687"

@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pyc
+.ingested_pdfs.json
+.ingested_pdfs.tmp
+.venv
+*snowflake.yml
+
