@@ -58,7 +58,7 @@ and stores reusable `StudyQuestion` nodes. The question player will serve these 
 questions immediately, without waiting for Gemini. Use `--limit` to test a small batch first.
 
 All generated questions are four-option multiple-choice questions. Set `QUESTION_LEVEL` in `.env`
-to control the target standard; the default is `AP Telangana Group 1 screening exam`.
+to control the target standard; the default is `Default`.
 
 When a question has no matching local graph material, configure `GEMINI_API_KEY` and the tutor
 uses Gemini as the knowledge fallback. Local graph results remain the preferred source.
