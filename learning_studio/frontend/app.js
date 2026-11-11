@@ -1,9 +1,95 @@
-const state = { sessionId: null, group: "", textbook: "", language: "en" };
+const state = { sessionId: null, group: "", textbook: "", language: "en", currentTopic: "" };
 let loadingNextQuestion = false;
 let libraryByFilename = new Map();
 let libraryReady = false;
 state.flow = "guided";
 state.questionId = null;
+
+function renderSuggestions(topic = null) {
+  const current = topic || state.currentTopic;
+  const suggestions = current ? [
+    `Ask from ${current}`,
+    `Change question`,
+    `Summarize ${current} in 2 paragraphs`,
+  ] : [
+    `Summarize the main concepts in ${state.textbook || "this textbook"}`,
+    `Explain a key topic from ${state.textbook || "this textbook"}`,
+    `Change question`,
+  ];
+  $("#suggestions").replaceChildren(...suggestions.map((text) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = text;
+    button.addEventListener("click", () => {
+      if (text === "Change question") {
+        changeQuestion();
+      } else {
+        $("#chat-input").value = text;
+        submitChatMessage(text);
+      }
+    });
+    return button;
+  }));
+}
+
+async function changeQuestion() {
+  if (loadingNextQuestion) return;
+  $("#next-question-status").textContent = "Loading next question...";
+  $("#next-question-status").classList.remove("hidden");
+  try {
+    await startLearningFlow();
+    toast("Question changed!");
+  } catch (err) {
+    toast(err.message);
+  }
+}
+
+async function sendMessage(message, topic = null) {
+  if (!state.sessionId) await createSession();
+  const response = await fetch(`/api/v1/sessions/${state.sessionId}/chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      message,
+      language: state.language,
+      topic: topic || state.currentTopic || null,
+    }),
+  });
+  if (!response.ok) throw new Error("No matching content was found in the selected textbook.");
+  return response.json();
+}
+
+async function submitChatMessage(message) {
+  const clean = (message || "").trim();
+  if (!clean) return;
+  const lower = clean.toLowerCase();
+  const changeTriggers = ["change question", "next question", "another question", "new question", "skip question", "give me another question", "different question"];
+  if (changeTriggers.includes(lower)) {
+    $("#user-text").textContent = clean;
+    $("#user-message").classList.remove("hidden");
+    $("#assistant-text").textContent = "Loading a new question for you in the question player above...";
+    $("#assistant-message").classList.remove("hidden");
+    changeQuestion();
+    return;
+  }
+
+  $("#user-text").textContent = clean;
+  $("#user-message").classList.remove("hidden");
+  $("#assistant-text").textContent = "Thinking...";
+  $("#assistant-message").classList.remove("hidden");
+  try {
+    const result = await sendMessage(clean, state.currentTopic);
+    $("#assistant-text").textContent = result.answer;
+    $("#assistant-message").classList.remove("hidden");
+    if (result.action === "change_question") {
+      changeQuestion();
+    }
+    refreshProgress();
+  } catch (error) {
+    toast(error.message);
+    $("#assistant-message").classList.add("hidden");
+  }
+}
 const copy = {
   en: { studio: "Studio", placeholder: "Ask anything about your selected textbook..." },
   te: { studio: "స్టూడియో", placeholder: "మీరు ఎంచుకున్న పాఠ్యపుస్తకం గురించి అడగండి..." },
@@ -62,8 +148,8 @@ async function createSession() {
     });
     if (!response.ok) throw new Error("Session could not be created");
     state.sessionId = (await response.json()).session_id;
-      $("#breadcrumb-text").textContent = displayName(state.textbook);
-      $("#source-text").textContent = displayName(state.textbook);
+    $("#breadcrumb-text").textContent = displayName(state.textbook);
+    $("#source-text").textContent = displayName(state.textbook);
     $("#source-status").textContent = "● Ready";
     $("#welcome-text").textContent = `Study ${state.textbook} using the indexed knowledge graph.`;
     renderSuggestions();
@@ -73,24 +159,6 @@ async function createSession() {
     toast(error.message);
     return false;
   }
-
-  function renderSuggestions() {
-    const suggestions = [
-      `Summarize the main concepts in ${state.textbook}`,
-      `Explain a key topic from ${state.textbook}`,
-      `Show connections between concepts in ${state.textbook}`,
-    ];
-    $("#suggestions").replaceChildren(...suggestions.map((text) => {
-      const button = document.createElement("button");
-      button.textContent = text;
-      button.addEventListener("click", () => {
-        $("#chat-input").value = text;
-        $("#chat-input").focus();
-      });
-      return button;
-    }));
-  }
-
 }
 
 async function refreshProgress() {
@@ -101,17 +169,6 @@ async function refreshProgress() {
   $("#progress-bar").style.width = `${progress.percent}%`;
   $("#progress-percent").textContent = `${progress.percent}% explored`;
   $("#progress-label").textContent = `${progress.messages} messages · ${progress.questions} questions`;
-}
-
-async function sendMessage(message) {
-  if (!state.sessionId) await createSession();
-  const response = await fetch(`/api/v1/sessions/${state.sessionId}/chat`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ message, language: state.language }),
-  });
-  if (!response.ok) throw new Error("No matching content was found in the selected textbook.");
-  return response.json();
 }
 
 async function startLearningFlow() {
@@ -138,6 +195,7 @@ async function startLearningFlow() {
   }
   const plan = await response.json();
   state.questionId = plan.question.question_id;
+  state.currentTopic = plan.topic;
   $("#lesson-topic").textContent = displayName(plan.topic);
   $("#lesson-source").textContent = plan.source === "fallback"
     ? "AI FALLBACK"
@@ -152,6 +210,13 @@ async function startLearningFlow() {
   $("#screening-feedback").classList.add("hidden");
   $("#lesson").classList.remove("hidden");
   loadingNextQuestion = false;
+
+  const askBtn = $("#ask-entity-btn");
+  if (askBtn) {
+    askBtn.textContent = `Ask from ${displayName(plan.topic)} ✦`;
+  }
+  renderSuggestions(plan.topic);
+
   document.querySelectorAll("[data-option]").forEach((button) => button.addEventListener("click", () => submitScreening(Number(button.dataset.option))));
 }
 
@@ -201,22 +266,28 @@ async function submitScreening(optionIndex) {
   refreshProgress();
 }
 
+$("#change-question-btn")?.addEventListener("click", () => changeQuestion());
+$("#ask-entity-btn")?.addEventListener("click", () => {
+  if (state.currentTopic) {
+    const prompt = `Ask from ${state.currentTopic}`;
+    $("#chat-input").value = prompt;
+    submitChatMessage(prompt);
+  }
+});
+
 $("#chat-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const input = $("#chat-input");
   const message = input.value.trim();
   if (!message) return;
   input.value = "";
-  $("#user-text").textContent = message;
-  $("#user-message").classList.remove("hidden");
-  $("#assistant-message").classList.add("hidden");
-  try {
-    const result = await sendMessage(message);
-    $("#assistant-text").textContent = result.answer;
-    $("#assistant-message").classList.remove("hidden");
-    refreshProgress();
-  } catch (error) {
-    toast(error.message);
+  await submitChatMessage(message);
+});
+
+$("#chat-input").addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && !event.shiftKey) {
+    event.preventDefault();
+    $("#chat-form").requestSubmit();
   }
 });
 

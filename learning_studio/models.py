@@ -49,12 +49,14 @@ class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
     document_id: str | None = None
     language: str = Field(default="en", pattern="^(en|te)$")
+    topic: str | None = None
 
 
 class ChatResponse(BaseModel):
     session_id: str
     answer: str
     citations: list[dict] = Field(default_factory=list)
+    action: str | None = None
 
 
 class QuestionRequest(BaseModel):

@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 import json
 import logging
 from pathlib import Path
+import re
 import uuid
 
 import httpx
@@ -462,47 +463,169 @@ def screening_attempt(
         graph.close()
 
 
+def extract_entity_from_chat(message: str, fallback_topic: str | None = None) -> str:
+    cleaned = message.strip()
+    patterns = [
+        r"^ask\s+from\s*[:\-]?\s*\[?([^\]\?\.\n]+)\]?",
+        r"^ask\s+about\s*[:\-]?\s*\[?([^\]\?\.\n]+)\]?",
+        r"^tell\s+me\s+about\s*[:\-]?\s*\[?([^\]\?\.\n]+)\]?",
+        r"^summarize\s*[:\-]?\s*\[?([^\]\?\.\n]+)\]?",
+        r"^what\s+is\s*[:\-]?\s*\[?([^\]\?\.\n]+)\]?",
+        r"^explain\s*[:\-]?\s*\[?([^\]\?\.\n]+)\]?",
+    ]
+    for pat in patterns:
+        m = re.match(pat, cleaned, re.IGNORECASE)
+        if m:
+            candidate = m.group(1).strip().strip("'\"[]")
+            if candidate:
+                return candidate
+    return (fallback_topic or "").strip()
+
+
+def synthesize_fast_two_paragraphs(
+    topic: str,
+    textbook: str,
+    passages: list[dict],
+    evidence: list[dict],
+    citations: list[dict],
+) -> str:
+    display_topic = topic or "This subject"
+
+    # Paragraph 1: Definition and overview from passages, citations, or evidence
+    p1 = ""
+    if passages:
+        raw = passages[0]["text"].replace("\n", " ").strip()
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", raw) if s.strip()]
+        p1 = " ".join(sentences[:2])
+        if not p1.endswith("."):
+            p1 += "."
+    elif citations and citations[0].get("description"):
+        p1 = f"{display_topic} is an essential concept in {textbook}. {citations[0]['description']}".strip()
+    elif evidence:
+        p1 = f"{display_topic} is categorized as a {evidence[0]['entity_type']} in {textbook}, playing an integral role in the study curriculum."
+    else:
+        p1 = f"{display_topic} represents a key conceptual topic covered in {textbook} for competitive examinations."
+
+    # Paragraph 2: Relationships, connected entities, and exam relevance
+    p2 = ""
+    if evidence:
+        rels = [f"{e['relationship']} {e['entity_name']}" for e in evidence[:4] if e.get("entity_name")]
+        if rels:
+            p2 = f"In the knowledge graph, {display_topic} is linked with {', '.join(rels)}. Understanding these core linkages and structural interactions is vital for analytical exam questions."
+    if not p2:
+        if len(passages) > 1:
+            raw2 = passages[1]["text"].replace("\n", " ").strip()
+            sentences2 = [s.strip() for s in re.split(r"(?<=[.!?])\s+", raw2) if s.strip()]
+            p2 = " ".join(sentences2[:2])
+            if not p2.endswith("."):
+                p2 += "."
+        else:
+            p2 = f"Detailed analysis of {display_topic} reinforces conceptual clarity and contextual recall across related chapters in {textbook}."
+
+    return f"{p1}\n\n{p2}"
+
+
 @app.post(f"{settings.api_prefix}/sessions/{{session_id}}/chat", response_model=ChatResponse)
 def chat(session_id: str, request: ChatRequest) -> ChatResponse:
+    clean_msg = request.message.strip().lower()
+    change_triggers = {
+        "change question",
+        "next question",
+        "another question",
+        "new question",
+        "skip question",
+        "give me another question",
+        "different question",
+    }
     graph = KnowledgeGraph(settings)
     try:
-        history = graph.recent_messages(session_id)
         session_context = graph.session_context(session_id)
         if not session_context:
             raise HTTPException(status_code=404, detail="Study session not found")
-        citations = graph.search(
-            request.message,
-            limit=8,
-            textbook=session_context["textbook"],
-        )
-        if not citations and not settings.fallback_for_textbook:
-            raise HTTPException(
-                status_code=404,
-                detail="No matching content was found in the selected textbook",
+        textbook = session_context.get("textbook", "")
+
+        # Fast path 1: Change question intent
+        if clean_msg in change_triggers or any(clean_msg.startswith(t) for t in change_triggers):
+            answer = (
+                "I've updated the question player with a new question from your textbook.\n\n"
+                "You can attempt the new knowledge check above or ask more questions here anytime!"
             )
-        context = "\n".join(
-            [
-                f"Study group: {session_context.get('group')}",
-                f"Textbook: {session_context.get('textbook')}",
-                *(f"{item['role']}: {item['content']}" for item in history),
-                *(f"Concept: {item['concept']} (page {item.get('page')}) - {item.get('description')}" for item in citations),
-            ]
+            graph.save_message(session_id, "user", request.message)
+            graph.save_message(session_id, "assistant", answer)
+            return ChatResponse(session_id=session_id, answer=answer, citations=[], action="change_question")
+
+        # Fast path 2: App-aware entity resolution
+        active_topic = (request.topic or "").strip() or graph.last_screening_entity(session_id) or ""
+        entity_name = extract_entity_from_chat(request.message, active_topic)
+
+        citations = []
+        entity_evidence = []
+        passages = []
+
+        if entity_name:
+            citations = graph.search(entity_name, limit=8, textbook=textbook)
+            entity_evidence = graph.textbook_entity_evidence(textbook, topic=entity_name, limit=16)
+            passages = graph.textbook_passages(textbook, topic=entity_name, limit=4)
+
+        if not citations:
+            citations = graph.search(request.message, limit=8, textbook=textbook)
+        if not passages:
+            passages = graph.textbook_passages(textbook, topic=request.message, limit=4)
+
+        if not citations and not passages and not entity_evidence and active_topic and active_topic != entity_name:
+            citations = graph.search(active_topic, limit=8, textbook=textbook)
+            entity_evidence = graph.textbook_entity_evidence(textbook, topic=active_topic, limit=16)
+            passages = graph.textbook_passages(textbook, topic=active_topic, limit=4)
+
+        history = graph.recent_messages(session_id)
+        passage_summary = "\n".join(f"(page {item.get('page', '')}): {item['text']}" for item in passages[:3])
+        evidence_summary = "\n".join(
+            f"{item['entity_type']}: {item['entity_name']} [{item['relationship']}]"
+            for item in entity_evidence[:8]
         )
+
+        ground_context = passage_summary or evidence_summary or "\n".join(
+            f"{c['concept']}: {c.get('description', '')}" for c in citations[:4]
+        )
+
         instruction = chat_prompt(
             request.message,
             "Telugu" if request.language == "te" else "English",
+            passages=ground_context,
+            entity=entity_name or active_topic,
         )
-        if not citations:
-            context += (
-                f"\nConfigured fallback scope: {settings.fallback_for_textbook}\n"
-                f"{FALLBACK_CONTEXT}\n"
-            )
-            instruction += FALLBACK_LABEL
+
+        context_blocks = [
+            f"Study group: {session_context.get('group')}",
+            f"Textbook: {textbook}",
+            *(f"{item['role']}: {item['content']}" for item in history[-4:]),
+        ]
+        if entity_name:
+            context_blocks.append(f"Focus Entity: {entity_name}")
+        if ground_context:
+            context_blocks.append(f"Ground Truth:\n{ground_context}")
+        context = "\n".join(context_blocks)
+
+        answer = None
         provider = AIProvider(settings)
         try:
-            answer = provider.answer(instruction, context)
-        except (AIExtractionError, httpx.HTTPError) as exc:
-            raise HTTPException(status_code=502, detail=f"AI tutor unavailable: {exc}") from exc
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(provider.answer, instruction, context)
+                answer = future.result(timeout=min(float(settings.question_generation_timeout_seconds), 4.0))
+        except (FutureTimeoutError, TimeoutError):
+            logger.warning("AI provider answer timed out; using instant 2-paragraph synthesis")
+        except Exception as exc:
+            logger.warning("AI provider answer failed (%s); using instant 2-paragraph synthesis", exc)
+
+        if not answer or not answer.strip():
+            answer = synthesize_fast_two_paragraphs(
+                entity_name or active_topic or request.message,
+                textbook,
+                passages,
+                entity_evidence,
+                citations,
+            )
+
         graph.save_message(session_id, "user", request.message)
         graph.save_message(session_id, "assistant", answer)
         return ChatResponse(session_id=session_id, answer=answer, citations=citations)

@@ -68,7 +68,20 @@
 
           <div class="lesson hidden" id="lesson">
             <div class="lesson-kicker">LEARNING STEP <span class="lesson-source" id="lesson-source"></span></div><h2 id="lesson-topic"></h2><div class="lesson-etext" id="lesson-etext"></div><div class="lesson-summary"><strong>In short</strong><p id="lesson-summary"></p></div>
-            <div class="screening-card"><span class="eyebrow">KNOWLEDGE CHECK</span><h3 id="screening-question"></h3><div id="screening-options" class="screening-options"></div><p class="attempts" id="attempts"></p><p class="next-question-status hidden" id="next-question-status"></p><div class="feedback hidden" id="screening-feedback"></div></div>
+            <div class="screening-card">
+              <div class="screening-top-bar">
+                <span class="eyebrow">KNOWLEDGE CHECK</span>
+                <div class="screening-actions">
+                  <button type="button" class="screening-action-btn" id="change-question-btn" title="Change to a different question">Change question ↻</button>
+                  <button type="button" class="screening-action-btn" id="ask-entity-btn" title="Ask chatbot about this entity">Ask from topic ✦</button>
+                </div>
+              </div>
+              <h3 id="screening-question"></h3>
+              <div id="screening-options" class="screening-options"></div>
+              <p class="attempts" id="attempts"></p>
+              <p class="next-question-status hidden" id="next-question-status"></p>
+              <div class="feedback hidden" id="screening-feedback"></div>
+            </div>
           </div>
           <div class="chat" id="chat">
             <div class="message assistant">
