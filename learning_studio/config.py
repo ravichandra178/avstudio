@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     ollama_context_tokens: int = 8192
     ollama_max_output_tokens: int = 512
     question_generation_timeout_seconds: float = 5
+    chat_fallback_timeout_seconds: float = 12
     github_token: str = ""
     github_models_endpoint: str = "https://models.inference.ai.azure.com/chat/completions"
     github_models_name: str = "gpt-4o-mini"

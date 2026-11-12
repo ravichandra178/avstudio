@@ -228,19 +228,32 @@ class KnowledgeGraph:
         with self.session() as session:
             result = session.run(
                 """
-                MATCH (d:Document)-[:MENTIONS]->(c)
-                WITH properties(d) AS document_properties, properties(c) AS chunk_properties
+                MATCH (d:Document)
+                OPTIONAL MATCH (d)-[:HAS_CHUNK]->(chunk:Chunk)
+                WITH properties(d) AS document_properties,
+                     properties(chunk) AS chunk_properties
+                WITH document_properties,
+                     coalesce(
+                         chunk_properties.text,
+                         document_properties.text,
+                         document_properties.page_content
+                     ) AS passage_text,
+                     coalesce(chunk_properties.page, document_properties.page) AS page
                 WHERE (
                     document_properties.filename = $textbook
                     OR document_properties.name = $textbook
                     OR document_properties.source = $textbook
                     OR document_properties.id = $textbook
                 )
-                  AND chunk_properties.text IS NOT NULL
-                  AND ($topic IS NULL OR toLower(chunk_properties.text) CONTAINS toLower($topic))
-                RETURN DISTINCT chunk_properties.text AS text,
-                       chunk_properties.page AS page
-                ORDER BY page
+                  AND passage_text IS NOT NULL
+                  AND ($topic IS NULL OR toLower(passage_text) CONTAINS toLower($topic))
+                WITH DISTINCT passage_text, page,
+                     CASE
+                         WHEN $topic IS NULL THEN 0
+                         ELSE size(split(toLower(passage_text), toLower($topic))) - 1
+                     END AS topic_match_count
+                RETURN passage_text AS text, page
+                ORDER BY topic_match_count DESC, page
                 LIMIT $limit
                 """,
                 textbook=textbook,
@@ -535,8 +548,10 @@ class KnowledgeGraph:
                 OPTIONAL MATCH (s)-[:HAS_SCREENING_QUESTION]->(sq:ScreeningQuestion)
                 OPTIONAL MATCH (s)-[:ASKED]->(aq:StudyQuestion)
                 WITH s,
-                     collect(DISTINCT sq.question) + collect(DISTINCT aq.question) AS asked_questions,
-                     collect(DISTINCT sq.study_question_id) + collect(DISTINCT aq.id) AS asked_ids
+                     [value IN collect(DISTINCT sq.question) + collect(DISTINCT aq.question)
+                      WHERE value IS NOT NULL] AS asked_questions,
+                     [value IN collect(DISTINCT sq.study_question_id) + collect(DISTINCT aq.id)
+                      WHERE value IS NOT NULL] AS asked_ids
 
                 MATCH (q:StudyQuestion)
                 WHERE (q.textbook = $textbook OR q.textbook IS NULL)
@@ -584,51 +599,98 @@ class KnowledgeGraph:
                 OPTIONAL MATCH (s)-[:HAS_SCREENING_QUESTION]->(sq:ScreeningQuestion)
                 OPTIONAL MATCH (s)-[:ASKED]->(aq:StudyQuestion)
                 WITH s,
-                     collect(DISTINCT sq.question) + collect(DISTINCT aq.question) AS asked_questions,
-                     collect(DISTINCT sq.study_question_id) + collect(DISTINCT aq.id) AS asked_ids
+                     [value IN collect(DISTINCT sq.question) + collect(DISTINCT aq.question)
+                      WHERE value IS NOT NULL] AS asked_questions,
+                     [value IN collect(DISTINCT sq.study_question_id) + collect(DISTINCT aq.id)
+                      WHERE value IS NOT NULL] AS asked_ids
 
-                // Find directly connected entities in the knowledge graph
-                OPTIONAL MATCH (e)-[r]-(related)
-                WHERE $anchor_entity <> '' AND (
-                    toLower(coalesce(e.name, e.title, e.text, e.id, '')) = toLower($anchor_entity)
-                    OR (
-                        size($anchor_entity) >= 3 AND
-                        toLower(coalesce(e.name, e.title, e.text, e.id, '')) CONTAINS toLower($anchor_entity)
-                    )
-                )
-                AND NOT any(l IN labels(related) WHERE l IN [
-                    'StudyGroup', 'Textbook', 'Document', 'Chunk', 'StudySession', 'StudyMessage'
-                ])
-                WITH s, asked_questions, asked_ids,
-                     collect(DISTINCT toLower(coalesce(related.name, related.title, related.text, related.id, ''))) AS direct_related
-
+                MATCH (anchor)
+                WHERE $anchor_entity <> ''
+                  AND toLower(coalesce(
+                      anchor.name, anchor.title, anchor.text, anchor.id, ''
+                  )) = toLower($anchor_entity)
                 MATCH (q:StudyQuestion)
-                WHERE (q.textbook = $textbook OR q.textbook IS NULL)
+                WHERE q.textbook = $textbook
+                  AND q.entity_name IS NOT NULL
+                  AND toLower(q.entity_name) <> toLower($anchor_entity)
                   AND q.question IS NOT NULL AND trim(q.question) <> ''
                   AND q.options IS NOT NULL
                   AND NOT q.question IN asked_questions
                   AND NOT q.id IN asked_ids
+                MATCH (candidate)
+                WHERE toLower(coalesce(
+                          candidate.name, candidate.title, candidate.text, candidate.id, ''
+                      )) = toLower(q.entity_name)
+                  AND NOT any(label IN labels(candidate) WHERE label IN [
+                      'StudyGroup', 'Textbook', 'Document', 'Chunk',
+                      'StudySession', 'StudyMessage', 'StudyQuestion',
+                      'ScreeningQuestion'
+                  ])
+                MATCH path = (anchor)-[*..5]-(candidate)
+                WHERE all(node IN nodes(path) WHERE
+                    node = anchor OR node = candidate
+                    OR (
+                        'Document' IN labels(node)
+                        AND toLower(coalesce(
+                            node.filename, node.name, node.source, node.id, ''
+                        )) = toLower($textbook)
+                    )
+                    OR (
+                        NOT any(label IN labels(node) WHERE label IN [
+                            'StudyGroup', 'Textbook', 'Document', 'Chunk',
+                            'StudySession', 'StudyMessage', 'StudyQuestion',
+                            'ScreeningQuestion'
+                        ])
+                    )
+                )
+                WITH q, length(path) AS hops
                 RETURN q.id AS question_id, q.question AS question, q.options AS options,
                        q.correct_option AS correct_option, q.answer AS answer,
                        q.explanation AS explanation, q.citations AS citations,
                        q.entity_name AS entity_name, q.entity_type AS entity_type,
-                       coalesce(q.liked, false) AS liked,
-                       CASE
-                           WHEN toLower(coalesce(q.entity_name, '')) IN direct_related THEN 1
-                           WHEN $anchor_entity <> '' AND toLower(coalesce(q.citations, '')) CONTAINS toLower($anchor_entity) THEN 2
-                           WHEN $anchor_entity <> '' AND toLower(coalesce(q.question, '')) CONTAINS toLower($anchor_entity) THEN 3
-                           ELSE 4
-                       END AS score
-                ORDER BY score ASC, coalesce(q.created_at, datetime()) DESC
+                       coalesce(q.liked, false) AS liked
+                ORDER BY hops ASC, rand()
                 LIMIT 1
                 """,
                 session_id=session_id,
-                textbook=textbook,
                 anchor_entity=anchor_entity,
+                textbook=textbook,
             ).single()
+
+            if result is None:
+                result = session.run(
+                    """
+                    MATCH (s:StudySession {id: $session_id})
+                    OPTIONAL MATCH (s)-[:HAS_SCREENING_QUESTION]->(sq:ScreeningQuestion)
+                    OPTIONAL MATCH (s)-[:ASKED]->(aq:StudyQuestion)
+                    WITH s,
+                         [value IN collect(DISTINCT sq.question) + collect(DISTINCT aq.question)
+                          WHERE value IS NOT NULL] AS asked_questions,
+                         [value IN collect(DISTINCT sq.study_question_id) + collect(DISTINCT aq.id)
+                          WHERE value IS NOT NULL] AS asked_ids
+                    MATCH (q:StudyQuestion)
+                    WHERE q.textbook = $textbook
+                      AND q.entity_name IS NOT NULL
+                      AND ($anchor_entity = '' OR toLower(q.entity_name) <> toLower($anchor_entity))
+                      AND q.question IS NOT NULL AND trim(q.question) <> ''
+                      AND q.options IS NOT NULL
+                      AND NOT q.question IN asked_questions
+                      AND NOT q.id IN asked_ids
+                    RETURN q.id AS question_id, q.question AS question, q.options AS options,
+                           q.correct_option AS correct_option, q.answer AS answer,
+                           q.explanation AS explanation, q.citations AS citations,
+                           q.entity_name AS entity_name, q.entity_type AS entity_type,
+                           coalesce(q.liked, false) AS liked
+                    ORDER BY rand()
+                    LIMIT 1
+                    """,
+                    session_id=session_id,
+                    textbook=textbook,
+                    anchor_entity=anchor_entity,
+                ).single()
             if not result:
                 return None
-            return self._sanitize_question_dict(result.data(), default_entity=anchor_entity)
+            return self._sanitize_question_dict(result.data())
 
     def mark_question_asked(self, session_id: str, question_id: str) -> None:
         with self.session() as session:

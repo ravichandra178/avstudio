@@ -7,3 +7,5 @@ __pycache__/
 *snowflake.yml
 .pytest_cache/
 my_pdfs/
+.ruff_cache/
+.DS_Store

@@ -1,4 +1,4 @@
-const state = { sessionId: null, group: "", textbook: "", language: "en", currentTopic: "" };
+const state = { sessionId: null, group: "", textbook: "", language: "en", currentTopic: "", nextTopic: "" };
 let loadingNextQuestion = false;
 let libraryByFilename = new Map();
 let libraryReady = false;
@@ -8,7 +8,7 @@ state.questionId = null;
 function renderSuggestions(topic = null) {
   const current = topic || state.currentTopic;
   const suggestions = current ? [
-    `Ask from ${current}`,
+    ...(state.nextTopic ? [`Ask from ${state.nextTopic}`] : []),
     `Change question`,
     `Summarize ${current} in 2 paragraphs`,
   ] : [
@@ -23,6 +23,8 @@ function renderSuggestions(topic = null) {
     button.addEventListener("click", () => {
       if (text === "Change question") {
         changeQuestion();
+      } else if (text.startsWith("Ask from ") && state.nextTopic) {
+        askFromRelatedEntity();
       } else {
         $("#chat-input").value = text;
         submitChatMessage(text);
@@ -40,6 +42,16 @@ async function changeQuestion() {
     await startLearningFlow();
     toast("Question changed!");
   } catch (err) {
+    toast(err.message);
+  }
+}
+
+async function askFromRelatedEntity() {
+  if (!state.nextTopic || loadingNextQuestion) return;
+  try {
+    await startLearningFlow({ topic: state.nextTopic });
+  } catch (err) {
+    $("#next-question-status").classList.add("hidden");
     toast(err.message);
   }
 }
@@ -171,7 +183,7 @@ async function refreshProgress() {
   $("#progress-label").textContent = `${progress.messages} messages · ${progress.questions} questions`;
 }
 
-async function startLearningFlow() {
+async function startLearningFlow({ topic = null } = {}) {
   loadingNextQuestion = true;
   $("#next-question-status").textContent = "Loading the next question...";
   $("#next-question-status").classList.remove("hidden");
@@ -180,7 +192,11 @@ async function startLearningFlow() {
     response = await fetch(`/api/v1/sessions/${state.sessionId}/learning-plan`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ mode: state.flow, topic: $("#flow-topic").value.trim(), language: state.language }),
+      body: JSON.stringify({
+        mode: state.flow,
+        topic: topic || $("#flow-topic").value.trim(),
+        language: state.language,
+      }),
     });
   } catch (error) {
     loadingNextQuestion = false;
@@ -188,14 +204,21 @@ async function startLearningFlow() {
     throw error;
   }
   if (!response.ok) {
-    let detail = "The textbook lesson could not be created.";
-    try { detail = (await response.json()).detail || detail; } catch (_) { /* use default */ }
+    const body = await response.text();
+    let detail = body;
+    try {
+      const error = JSON.parse(body);
+      detail = error.detail || body;
+    } catch (_) {
+      if (!detail) detail = response.statusText;
+    }
     loadingNextQuestion = false;
-    throw new Error(detail);
+    throw new Error(detail || `Lesson request failed (HTTP ${response.status})`);
   }
   const plan = await response.json();
   state.questionId = plan.question.question_id;
   state.currentTopic = plan.topic;
+  state.nextTopic = plan.next_topic || "";
   $("#lesson-topic").textContent = displayName(plan.topic);
   $("#lesson-source").textContent = plan.source === "fallback"
     ? "AI FALLBACK"
@@ -213,7 +236,10 @@ async function startLearningFlow() {
 
   const askBtn = $("#ask-entity-btn");
   if (askBtn) {
-    askBtn.textContent = `Ask from ${displayName(plan.topic)} ✦`;
+    askBtn.classList.toggle("hidden", !state.nextTopic);
+    if (state.nextTopic) {
+      askBtn.textContent = `Ask from ${displayName(state.nextTopic)} ✦`;
+    }
   }
   renderSuggestions(plan.topic);
 
@@ -267,13 +293,7 @@ async function submitScreening(optionIndex) {
 }
 
 $("#change-question-btn")?.addEventListener("click", () => changeQuestion());
-$("#ask-entity-btn")?.addEventListener("click", () => {
-  if (state.currentTopic) {
-    const prompt = `Ask from ${state.currentTopic}`;
-    $("#chat-input").value = prompt;
-    submitChatMessage(prompt);
-  }
-});
+$("#ask-entity-btn")?.addEventListener("click", () => askFromRelatedEntity());
 
 $("#chat-form").addEventListener("submit", async (event) => {
   event.preventDefault();

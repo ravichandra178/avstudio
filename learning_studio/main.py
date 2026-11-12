@@ -49,11 +49,14 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    graph = KnowledgeGraph(settings)
     try:
-        graph.ensure_schema()
-    finally:
-        graph.close()
+        graph = KnowledgeGraph(settings)
+        try:
+            graph.ensure_schema()
+        finally:
+            graph.close()
+    except Exception as exc:
+        logger.warning("Neo4j schema initialization deferred on startup: %s", exc)
     yield
 
 
@@ -179,19 +182,26 @@ def learning_plan(session_id: str, request: LearningPlanRequest) -> LearningPlan
             raise HTTPException(status_code=404, detail="Study session not found")
         textbook = session_context["textbook"]
         raw_topic = (request.topic or "").strip()
+        related_from = (request.related_from or "").strip()
 
         # Step 1: Zero-lag fetch for selected entity question from Neo4j
         db_question = None
         source_mode = "selected_entity"
-        if raw_topic:
+        if raw_topic and not related_from:
             db_question = graph.entity_question(session_id, textbook, raw_topic)
 
-        # Step 2: Fallback 1 / Next Question - Fetch closest related question from database
+        # Asking from an entity means select a different, directly related entity first.
         if not db_question:
-            anchor = raw_topic or graph.last_screening_entity(session_id)
+            anchor = related_from or raw_topic or graph.last_screening_entity(session_id)
             db_question = graph.related_learning_question(session_id, textbook, anchor)
             if db_question:
                 source_mode = "related_entity" if anchor else "textbook_bank"
+                logger.info(
+                    "LEARNING_RELATED_QUESTION session=%s anchor=%s selected_entity=%s",
+                    session_id,
+                    anchor,
+                    db_question.get("entity_name"),
+                )
 
         # If found in database: return immediately with zero lag
         if db_question:
@@ -235,11 +245,29 @@ def learning_plan(session_id: str, request: LearningPlanRequest) -> LearningPlan
                     passages = graph.textbook_passages(textbook, topic=raw_topic, limit=2)
 
                 if passages:
-                    etext = passages[0]["text"]
-                    summary = f"Key concept: {entity_name}. Review the passage above and answer the question below."
+                    topic_passage = textbook_topic_excerpt(
+                        passages[0]["text"], entity_name, max_words=120
+                    )
+                    etext = redact_quiz_answer(
+                        topic_passage,
+                        options,
+                        correct_option,
+                    )
+                    if not etext:
+                        etext = (
+                            f"Review the textbook material related to {entity_name}. "
+                            "Recall its key facts before answering the knowledge check."
+                        )
+                    summary = textbook_topic_excerpt(
+                        passages[0]["text"], entity_name, max_words=60
+                    )
                 else:
-                    etext = f"{entity_name}: {explanation}" if explanation else f"Review key exam topic: {entity_name}."
-                    summary = f"Key exam topic: {entity_name}. Review the concept facts and test your understanding below."
+                    etext = (
+                        f"No descriptive passage about {entity_name} was found in "
+                        f"{textbook}. The index only contains an entity mention, so it "
+                        "cannot provide a textbook-grounded summary."
+                    )
+                    summary = "No descriptive textbook passage is indexed for this topic."
 
                 # Persist screening question to session and mark as asked
                 screening_question_id = str(uuid.uuid4())
@@ -259,6 +287,28 @@ def learning_plan(session_id: str, request: LearningPlanRequest) -> LearningPlan
                 )
                 if db_question.get("question_id"):
                     graph.mark_question_asked(session_id, db_question["question_id"])
+                try:
+                    next_question = graph.related_learning_question(
+                        session_id, textbook, entity_name
+                    )
+                except Neo4jError:
+                    logger.exception(
+                        "LEARNING_RELATED_SUGGESTION_FAILED session=%s entity=%s",
+                        session_id,
+                        entity_name,
+                    )
+                    next_topic = None
+                else:
+                    candidate_topic = (
+                        str(next_question["entity_name"]).strip()
+                        if next_question and next_question.get("entity_name")
+                        else ""
+                    )
+                    next_topic = (
+                        candidate_topic
+                        if candidate_topic.casefold() != entity_name.casefold()
+                        else None
+                    )
 
                 logger.info(
                     "LEARNING_QUESTION_ZERO_LAG session=%s source=%s entity=%s question_id=%s",
@@ -272,6 +322,7 @@ def learning_plan(session_id: str, request: LearningPlanRequest) -> LearningPlan
                     session_id=session_id,
                     mode=request.mode,
                     topic=entity_name,
+                    next_topic=next_topic,
                     etext=etext,
                     summary=summary,
                     question=ScreeningQuestion(
@@ -289,6 +340,12 @@ def learning_plan(session_id: str, request: LearningPlanRequest) -> LearningPlan
                     db_question.get("question_id"),
                     db_question.get("options"),
                 )
+
+        if related_from:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No unanswered question for an entity other than {related_from} was found in this textbook",
+            )
 
         # Step 3: Fallback 2 - Use LLM when no questions found in Neo4j
         logger.info("LEARNING_QUESTION_FALLBACK_LLM session=%s topic=%s", session_id, raw_topic)
@@ -483,10 +540,61 @@ def extract_entity_from_chat(message: str, fallback_topic: str | None = None) ->
     for pat in patterns:
         m = re.match(pat, cleaned, re.IGNORECASE)
         if m:
-            candidate = m.group(1).strip().strip("'\"[]")
+            candidate = re.sub(
+                r"\s+in\s+(?:two|2)\s+paragraphs?$",
+                "",
+                m.group(1).strip().strip("'\"[]"),
+                flags=re.IGNORECASE,
+            ).strip()
             if candidate:
                 return candidate
     return (fallback_topic or "").strip()
+
+
+def redact_quiz_answer(text: str, options: list[str], correct_option: int) -> str:
+    answer = options[correct_option].strip()
+    sentences = [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?])\s+", text.replace("\n", " "))
+        if sentence.strip()
+    ]
+    safe_sentences = [
+        sentence
+        for sentence in sentences
+        if not re.search(r"\b(?:correct\s+)?answer\s+is\b", sentence, re.IGNORECASE)
+    ]
+    if answer:
+        answer_pattern = re.compile(rf"(?<!\w){re.escape(answer)}(?!\w)", re.IGNORECASE)
+        safe_sentences = [answer_pattern.sub("[hidden]", sentence) for sentence in safe_sentences]
+    return " ".join(safe_sentences).strip()
+
+
+def textbook_topic_excerpt(text: str, topic: str, max_words: int) -> str:
+    excerpt = re.sub(r"\s+", " ", text).strip()
+    topic_match = re.search(re.escape(topic), excerpt, re.IGNORECASE) if topic else None
+    if topic_match:
+        excerpt = excerpt[topic_match.start():]
+
+    bullets = re.split(r"\s*[●•]\s*", excerpt)
+    if len(bullets) > 1:
+        excerpt = " ".join(part.strip() for part in bullets[:4] if part.strip())
+    else:
+        sentences = [
+            sentence.strip()
+            for sentence in re.split(r"(?<=[.!?])\s+", excerpt)
+            if sentence.strip()
+        ]
+        excerpt = " ".join(sentences)
+
+    words = excerpt.split()
+    if len(words) <= max_words:
+        return excerpt
+
+    bounded = " ".join(words[:max_words])
+    sentence_ends = list(re.finditer(r"[.!?](?=\s|$)", bounded))
+    if sentence_ends:
+        return bounded[: sentence_ends[-1].end()]
+    return f"{bounded.rstrip(' ,;:')}…"
 
 
 def synthesize_fast_two_paragraphs(
@@ -498,7 +606,7 @@ def synthesize_fast_two_paragraphs(
 ) -> str:
     display_topic = topic or "This subject"
 
-    # Paragraph 1: Definition and overview from passages, citations, or broader context
+    # Keep chat responses bounded to facts actually returned by the textbook lookup.
     p1 = ""
     if passages:
         raw = passages[0]["text"].replace("\n", " ").strip()
@@ -507,27 +615,40 @@ def synthesize_fast_two_paragraphs(
         if not p1.endswith("."):
             p1 += "."
     elif citations and citations[0].get("description"):
-        p1 = f"{display_topic} is an essential concept documented in {textbook}. {citations[0]['description']}".strip()
+        p1 = f"{display_topic}: {citations[0]['description']}".strip()
     elif evidence:
-        p1 = f"{display_topic} is categorized as a {evidence[0]['entity_type']} in {textbook}, playing an integral role in the study curriculum."
+        entity_types = ", ".join(sorted({item["entity_type"] for item in evidence if item.get("entity_type")}))
+        p1 = f"The textbook knowledge graph identifies {display_topic} as: {entity_types}."
     else:
-        p1 = f"{display_topic} is a significant subject of study for competitive examinations, reflecting fundamental principles, contemporary developments, and public administration impacts."
+        p1 = f"No matching passage or entity details for {display_topic} were found in {textbook}."
 
-    # Paragraph 2: Relationships, connected entities, real-world context, and exam relevance
     p2 = ""
-    if evidence:
-        rels = [f"{e['relationship']} {e['entity_name']}" for e in evidence[:4] if e.get("entity_name")]
-        if rels:
-            p2 = f"In the knowledge graph, {display_topic} connects directly with {', '.join(rels)}. Understanding these core linkages and institutional interactions is vital for analytical exam questions."
-    if not p2:
-        if len(passages) > 1:
-            raw2 = passages[1]["text"].replace("\n", " ").strip()
-            sentences2 = [s.strip() for s in re.split(r"(?<=[.!?])\s+", raw2) if s.strip()]
-            p2 = " ".join(sentences2[:2])
-            if not p2.endswith("."):
-                p2 += "."
+    if len(passages) > 1:
+        raw2 = passages[1]["text"].replace("\n", " ").strip()
+        sentences2 = [s.strip() for s in re.split(r"(?<=[.!?])\s+", raw2) if s.strip()]
+        p2 = " ".join(sentences2[:2])
+        if p2 and not p2.endswith("."):
+            p2 += "."
+    elif evidence:
+        related = sorted(
+            {
+                f"{item['relationship']} {item['entity_name']}"
+                for item in evidence
+                if item.get("relationship") and item.get("entity_name")
+                and item["relationship"] != "MENTIONS"
+            }
+        )
+        if related:
+            p2 = f"Direct textbook graph relationships: {', '.join(related[:4])}."
         else:
-            p2 = f"Beyond foundational textbook coverage, exploring {display_topic} across contemporary real-world developments and administrative policies equips students with comprehensive analytical depth."
+            p2 = (
+                "The index contains an entity mention but no descriptive textbook passage "
+                "or additional factual relationship for this topic."
+            )
+    elif citations:
+        p2 = "The indexed textbook has no further details for this topic."
+    else:
+        p2 = "No supporting textbook evidence was found, so no additional facts are being inferred."
 
     return f"{p1}\n\n{p2}"
 
@@ -614,18 +735,28 @@ def chat(session_id: str, request: ChatRequest) -> ChatResponse:
             context_blocks.append(f"Ground Truth:\n{ground_context}")
         context = "\n".join(context_blocks)
 
-        answer = None
-        provider = AIProvider(settings)
-        try:
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(provider.answer, instruction, context)
-                answer = future.result(timeout=min(float(settings.question_generation_timeout_seconds), 4.0))
-        except (FutureTimeoutError, TimeoutError):
-            logger.warning("AI provider answer timed out; using instant 2-paragraph synthesis")
-        except Exception as exc:
-            logger.warning("AI provider answer failed (%s); using instant 2-paragraph synthesis", exc)
+        has_descriptive_evidence = any(
+            passage.get("text", "").strip() for passage in passages
+        ) or any(
+            citation.get("description") for citation in citations
+        ) or any(
+            item.get("relationship")
+            and item.get("relationship", "").upper() != "MENTIONS"
+            and item.get("entity_name")
+            for item in entity_evidence
+        )
+        has_graph_evidence = bool(passages or entity_evidence or citations)
 
-        if not answer or not answer.strip():
+        if has_descriptive_evidence:
+            logger.info(
+                "CHAT_SOURCE_TEXTBOOK_FAST session=%s textbook=%s topic=%s passages=%d entities=%d citations=%d",
+                session_id,
+                textbook,
+                entity_name or active_topic,
+                len(passages),
+                len(entity_evidence),
+                len(citations),
+            )
             answer = synthesize_fast_two_paragraphs(
                 entity_name or active_topic or request.message,
                 textbook,
@@ -633,6 +764,62 @@ def chat(session_id: str, request: ChatRequest) -> ChatResponse:
                 entity_evidence,
                 citations,
             )
+        elif has_graph_evidence:
+            logger.info(
+                "CHAT_SOURCE_GEMINI_SEARCH_FALLBACK session=%s textbook=%s topic=%s timeout_seconds=%s",
+                session_id,
+                textbook,
+                entity_name or active_topic,
+                settings.chat_fallback_timeout_seconds,
+            )
+            search_instruction = (
+                f"{instruction}\n\n"
+                "The indexed textbook contains only a mention of this entity, not explanatory "
+                "facts. Use Google Search grounding to research it. Clearly identify the response "
+                "as an AI-generated summary based on external sources, and do not present external "
+                "details as facts found in the textbook."
+            )
+            try:
+                answer = AIProvider(settings).gemini_search_answer(
+                    search_instruction,
+                    context,
+                    timeout_seconds=settings.chat_fallback_timeout_seconds,
+                )
+            except (AIExtractionError, httpx.HTTPError) as exc:
+                logger.error(
+                    "CHAT_GEMINI_SEARCH_FALLBACK_FAILED session=%s error_type=%s error=%s",
+                    session_id,
+                    type(exc).__name__,
+                    exc,
+                )
+                topic_label = entity_name or active_topic or request.message
+                answer = (
+                    f"I couldn't get an internet-grounded summary of {topic_label} "
+                    "from Gemini just now.\n\n"
+                    "The indexed textbook only contains a mention of this topic, not enough "
+                    "detail to summarize it. Please try again shortly."
+                )
+        else:
+            logger.info(
+                "CHAT_SOURCE_AI_FALLBACK session=%s provider_order=%s timeout_seconds=4",
+                session_id,
+                settings.providers,
+            )
+            try:
+                answer = AIProvider(settings).answer(
+                    instruction,
+                    context,
+                    timeout_seconds=min(float(settings.question_generation_timeout_seconds), 4.0),
+                )
+            except (AIExtractionError, httpx.HTTPError) as exc:
+                logger.warning("CHAT_AI_FALLBACK_FAILED session=%s error=%s", session_id, exc)
+                answer = synthesize_fast_two_paragraphs(
+                    entity_name or active_topic or request.message,
+                    textbook,
+                    passages,
+                    entity_evidence,
+                    citations,
+                )
 
         graph.save_message(session_id, "user", request.message)
         graph.save_message(session_id, "assistant", answer)

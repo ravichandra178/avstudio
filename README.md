@@ -61,7 +61,12 @@ All generated questions are four-option multiple-choice questions. Set `QUESTION
 to control the target standard; the default is `Default`.
 
 When a question has no matching local graph material, configure `GEMINI_API_KEY` and the tutor
-uses Gemini as the knowledge fallback. Local graph results remain the preferred source.
+uses Gemini as the knowledge fallback. If the graph only has a bare entity mention, Gemini Search
+grounding is used with a 12-second timeout (`CHAT_FALLBACK_TIMEOUT_SECONDS` can adjust it). Local
+graph results remain the preferred source.
+
+Learning-step summaries are extracted from matching textbook passages stored on `HAS_CHUNK` nodes
+or legacy source-document text. Entity mentions without a passage are not presented as summaries.
 
 ## Vector search prerequisites
 

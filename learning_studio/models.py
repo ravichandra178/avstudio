@@ -83,6 +83,7 @@ class QuestionLikeRequest(BaseModel):
 class LearningPlanRequest(BaseModel):
     mode: str = Field(pattern="^(guided|topic_focused)$")
     topic: str | None = Field(default=None, max_length=200)
+    related_from: str | None = Field(default=None, max_length=200)
     language: str = Field(default="en", pattern="^(en|te)$")
 
 
@@ -98,6 +99,7 @@ class LearningPlanResponse(BaseModel):
     session_id: str
     mode: str
     topic: str
+    next_topic: str | None = None
     etext: str
     summary: str
     question: ScreeningQuestion
