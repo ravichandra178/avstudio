@@ -47,15 +47,35 @@ The structured study experience uses:
 Conversation messages and generated questions are persisted in Neo4j, so the tutor can reference
 earlier questions and revisit repeated concepts with page-level citations.
 
-To pre-generate textbook questions with local Ollama, configure `OLLAMA_MODEL` and run:
+To pre-generate textbook questions, ensure the configured Ollama model is installed and run:
 
 ```bash
 .venv/bin/python ingest_question.py --textbook "Courseware on Science and Technology.pdf"
 ```
 
 The script reads direct `MENTIONS` entities from Neo4j, generates one grounded MCQ per entity,
-and stores reusable `StudyQuestion` nodes. The question player will serve these stored textbook
-questions immediately, without waiting for Gemini. Use `--limit` to test a small batch first.
+and stores reusable `StudyQuestion` nodes. Provider order is Gemini, Grok, then local Ollama.
+Set `USE_MODEL` to `GEMINI`, `GROK`, or `OLLAMA` to select the primary ingestion provider.
+The default and this workspace's `.env` select `OLLAMA`, using the local
+`qwen2.5-1.5b-instruct:local` alias copied from the downloaded Qwen model. Set `OLLAMA_MODEL` to an
+installed Ollama model name. Generation runs through the local Ollama API at `OLLAMA_ENDPOINT`;
+ingestion does not call Hugging Face. When selected, Ollama is used directly. Gemini falls back to
+Grok and then Ollama;
+Grok falls back to Ollama. Configure
+`GROK_API_KEY` for Grok; `GROK_MODEL` defaults to
+`grok-4.7`. Grok HTTP
+failures log the status and a truncated, API-key-redacted response body. Gemini requests time out after
+8 seconds by default, return at most 256 tokens, and a Gemini failure disables further Gemini calls
+for that run. Grok requests default to a 15-second timeout and also stop being retried after a
+failure. Adjust `GEMINI_QUESTION_TIMEOUT_SECONDS`, `GEMINI_QUESTION_MAX_OUTPUT_TOKENS`,
+`GROK_QUESTION_TIMEOUT_SECONDS`, `GROK_QUESTION_MAX_OUTPUT_TOKENS`, `QUESTION_INGEST_WORKERS`, and
+`QUESTION_INGEST_BATCH_SIZE` as needed. Generation uses four concurrent workers, but Ollama calls
+are limited to one at a time by default (`QUESTION_INGEST_OLLAMA_WORKERS`) to avoid overloading a
+local model after Gemini failures. Logs distinguish Ollama queue wait from model request duration.
+Neo4j reads and writes are batched. Use `--limit` to test a small batch first. The question player
+serves stored questions immediately. Ingestion logs configuration (excluding credentials), entity
+loading, existing-question skips, per-provider attempts/results and durations, batch
+storage/results, and run totals; failures include exception details for troubleshooting.
 
 All generated questions are four-option multiple-choice questions. Set `QUESTION_LEVEL` in `.env`
 to control the target standard; the default is `Default`.

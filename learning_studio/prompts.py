@@ -111,6 +111,8 @@ def entity_question_ingestion_prompt(
         "The correct answer must be directly supported by the supplied facts. "
         "Return JSON only with exactly: question, options, correct_option, explanation. "
         "options must contain exactly 4 strings and correct_option must be a zero-based integer. "
+        "Do not number the option strings. The correct_option index and explanation must identify "
+        "the same option; the first option has index 0. "
         "CRITICAL FORMAT RULE: If writing a statement-based question, put numbered statements (1, 2, 3) in the 'question' text itself, and make the 4 options combinations like '1 and 2 only', '2 and 3 only', or 'All of the above'. Do NOT put raw descriptive sentences as options unless it is a standard single-fact MCQ."
     )
 
