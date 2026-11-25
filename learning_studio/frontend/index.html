@@ -4,12 +4,15 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Learning Studio</title>
-    <link rel="stylesheet" href="/frontend/styles.css" />
+    <link rel="stylesheet" href="/frontend/styles.css?v=3" />
   </head>
   <body>
     <div class="setup-overlay" id="setup-overlay">
       <form class="setup-card" id="setup-form">
         <div class="brand-mark">L</div>
+        <button type="button" class="overlay-language" id="setup-language-switch" data-no-translate>
+          <span class="setup-lang-en active-lang">EN</span><span class="setup-lang-te">తె</span>
+        </button>
         <span class="eyebrow">WELCOME TO LEARNING STUDIO</span>
         <h1>Set up your study space</h1>
         <p>Choose your group and textbook. The tutor will use your library first, then Gemini when your graph has no answer.</p>
@@ -20,6 +23,9 @@
     </div>
     <div class="flow-overlay hidden" id="flow-overlay">
       <form class="flow-card" id="flow-form">
+        <button type="button" class="overlay-language" id="flow-language-switch" data-no-translate>
+          <span class="flow-lang-en active-lang">EN</span><span class="flow-lang-te">తె</span>
+        </button>
         <span class="eyebrow">YOUR NEXT STEP</span>
         <p class="selected-textbook" id="selected-textbook"></p>
         <h1>How do you want to learn?</h1>
@@ -29,6 +35,20 @@
         <p class="flow-status" id="flow-status">Suggestions are taken from the selected textbook. You can choose one or continue with the textbook overview.</p>
         <button class="setup-submit" type="submit">Start this lesson <span>→</span></button>
       </form>
+    </div>
+    <div class="graph-overlay hidden" id="graph-overlay" role="dialog" aria-modal="true" aria-labelledby="graph-dialog-title">
+      <section class="graph-card">
+        <button type="button" class="graph-close" id="close-graph" aria-label="Close knowledge graph">×</button>
+        <span class="eyebrow">KNOWLEDGE GRAPH</span>
+        <h1 id="graph-dialog-title">Choose an entity</h1>
+        <p class="graph-intro" id="graph-dialog-description">Select a textbook entity, then play a question about it.</p>
+        <label class="graph-search-label" for="graph-entity-search">Search entities</label>
+        <input id="graph-entity-search" type="search" placeholder="Type an entity name" autocomplete="off" />
+        <p class="graph-status" id="graph-status" role="status">Loading entities...</p>
+        <div class="graph-entities" id="graph-entities" role="listbox" aria-label="Textbook entities"></div>
+        <p class="graph-selected hidden" id="graph-selected" aria-live="polite"></p>
+        <button type="button" class="setup-submit" id="play-graph-question" disabled>Play question <span>→</span></button>
+      </section>
     </div>
     <div class="app-shell">
       <aside class="sidebar">
@@ -56,7 +76,7 @@
       <main class="main-content">
         <header class="topbar">
           <div class="breadcrumbs"><span>My library</span><b>›</b><strong id="breadcrumb-text">Select a textbook</strong></div>
-          <div class="top-actions"><button class="mobile-menu" id="mobile-menu" type="button" aria-label="Open navigation">☰</button><button class="language-switch" id="language-switch" type="button" aria-label="Switch language"><span class="lang-en active-lang">EN</span><span class="lang-te">తె</span></button><button class="plain-button">Share</button><button class="more">•••</button></div>
+          <div class="top-actions"><button class="mobile-menu" id="mobile-menu" type="button" aria-label="Open navigation">☰</button><button class="language-switch" id="language-switch" type="button" aria-label="Switch language" data-no-translate><span class="lang-en active-lang">EN</span><span class="lang-te">తె</span></button><button class="plain-button">Share</button><button class="more">•••</button></div>
         </header>
         <section class="workspace">
           <div class="welcome">

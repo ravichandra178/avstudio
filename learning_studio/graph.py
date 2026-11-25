@@ -3,6 +3,7 @@ import json
 from neo4j import Driver, GraphDatabase
 
 from .config import Settings
+from .language import is_language_text
 
 
 class KnowledgeGraph:
@@ -407,7 +408,13 @@ class KnowledgeGraph:
             }
 
     def question_bank(
-        self, session_id: str, mode: str, level: str, textbook: str, limit: int = 20
+        self,
+        session_id: str,
+        mode: str,
+        level: str,
+        textbook: str,
+        limit: int = 20,
+        language: str = "en",
     ) -> list[dict]:
         label = "PreviousQuestion" if mode == "previous" else "StudyQuestion"
         with self.session() as session:
@@ -416,8 +423,25 @@ class KnowledgeGraph:
                 MATCH (q:{label})
                 WHERE q.level = $level
                   AND ($mode = 'previous' OR q.textbook = $textbook OR q.textbook IS NULL)
-                RETURN q.id AS question_id, q.question AS question, q.options AS options,
-                       q.correct_option AS correct_option, q.answer AS answer,
+                RETURN q.id AS question_id,
+                       CASE WHEN $language = 'te'
+                            THEN q.question_te
+                            ELSE coalesce(q.question_en, q.question) END AS question,
+                       CASE WHEN $language = 'te'
+                            THEN q.options_te
+                            ELSE coalesce(q.options_en, q.options) END AS options,
+                       coalesce(q.question_en, q.question) AS question_en,
+                       q.question_te AS question_te,
+                       coalesce(q.options_en, q.options) AS options_en,
+                       q.options_te AS options_te,
+                       q.correct_option AS correct_option,
+                       CASE WHEN $language = 'te' AND $mode = 'previous'
+                            THEN q.answer_te
+                            ELSE coalesce(q.answer_en, q.answer) END AS answer,
+                       coalesce(q.answer_en, q.answer) AS answer_en,
+                       q.answer_te AS answer_te,
+                       q.explanation_en AS explanation_en,
+                       q.explanation_te AS explanation_te,
                        q.citations AS citations, coalesce(q.liked, false) AS liked
                 ORDER BY coalesce(q.year, 0) DESC, coalesce(q.asked_at, q.created_at) DESC
                 LIMIT $limit
@@ -425,9 +449,45 @@ class KnowledgeGraph:
                 mode=mode,
                 level=level,
                 textbook=textbook,
-                limit=limit,
+                language=language,
+                limit=min(limit * 10, 500) if mode == "previous" else limit,
             )
             questions = [record.data() for record in result]
+            if mode == "previous":
+                valid_questions = []
+                language_question_key = f"question_{language}"
+                language_options_key = f"options_{language}"
+                language_answer_key = f"answer_{language}"
+                for question in questions:
+                    question_text = question.get(language_question_key)
+                    options = question.get(language_options_key)
+                    answer = question.get(language_answer_key)
+                    if (
+                        not isinstance(question_text, str)
+                        or not question_text.strip()
+                        or not is_language_text(question_text, language)
+                        or (language == "te" and not any(
+                            "\u0c00" <= char <= "\u0c7f" for char in question_text
+                        ))
+                        or not isinstance(options, list)
+                        or len(options) < 2
+                        or not all(
+                            isinstance(option, str)
+                            and is_language_text(option, language)
+                            for option in options
+                        )
+                        or (
+                            isinstance(answer, str)
+                            and answer
+                            and not is_language_text(answer, language)
+                        )
+                    ):
+                        continue
+                    question["question"] = question_text
+                    question["options"] = options
+                    question["answer"] = answer
+                    valid_questions.append(question)
+                questions = valid_questions[:limit]
             for question in questions:
                 question["citations"] = json.loads(question["citations"] or "[]")
             return questions
@@ -439,6 +499,11 @@ class KnowledgeGraph:
                 MATCH (q:StudyQuestion)
                 WHERE q.textbook = $textbook AND coalesce(q.liked, false) = true
                 RETURN q.id AS question_id, q.question AS question, q.options AS options,
+                       q.question_en AS question_en, q.question_te AS question_te,
+                       q.options_en AS options_en, q.options_te AS options_te,
+                       q.answer_en AS answer_en, q.answer_te AS answer_te,
+                       q.explanation_en AS explanation_en,
+                       q.explanation_te AS explanation_te,
                        q.answer AS answer, q.citations AS citations, true AS liked
                 ORDER BY rand()
                 LIMIT 1
@@ -456,8 +521,9 @@ class KnowledgeGraph:
             result = session.run(
                 """
                 MATCH (s:StudySession {id: $session_id})
-                MATCH (q:StudyQuestion {id: $question_id})
-                WHERE q.textbook = s.textbook
+                MATCH (q {id: $question_id})
+                WHERE (q:StudyQuestion AND q.textbook = s.textbook)
+                   OR q:PreviousQuestion
                 SET q.liked = $liked
                 RETURN q.liked AS liked
                 """,
@@ -527,10 +593,20 @@ class KnowledgeGraph:
         return {
             "question_id": item.get("question_id"),
             "question": q_text,
+            "question_en": str(item.get("question_en") or q_text).strip(),
+            "question_te": item.get("question_te"),
             "options": options,
+            "options_en": item.get("options_en") or options,
+            "options_te": item.get("options_te"),
             "correct_option": correct_option,
             "answer": str(item.get("answer") or "").strip(),
+            "answer_en": str(item.get("answer_en") or item.get("answer") or "").strip(),
+            "answer_te": item.get("answer_te"),
             "explanation": str(item.get("explanation") or item.get("answer") or "").strip(),
+            "explanation_en": str(
+                item.get("explanation_en") or item.get("explanation") or ""
+            ).strip(),
+            "explanation_te": item.get("explanation_te"),
             "citations": citations,
             "entity_name": item.get("entity_name") or default_entity,
             "entity_type": item.get("entity_type"),
@@ -570,6 +646,11 @@ class KnowledgeGraph:
                   AND NOT q.question IN asked_questions
                   AND NOT q.id IN asked_ids
                 RETURN q.id AS question_id, q.question AS question, q.options AS options,
+                       q.question_en AS question_en, q.question_te AS question_te,
+                       q.options_en AS options_en, q.options_te AS options_te,
+                       q.explanation_en AS explanation_en,
+                       q.answer_en AS answer_en, q.answer_te AS answer_te,
+                       q.explanation_te AS explanation_te,
                        q.correct_option AS correct_option, q.answer AS answer,
                        q.explanation AS explanation, q.citations AS citations,
                        coalesce(q.entity_name, $entity_name) AS entity_name,
@@ -645,6 +726,11 @@ class KnowledgeGraph:
                 )
                 WITH q, length(path) AS hops
                 RETURN q.id AS question_id, q.question AS question, q.options AS options,
+                       q.question_en AS question_en, q.question_te AS question_te,
+                       q.options_en AS options_en, q.options_te AS options_te,
+                       q.answer_en AS answer_en, q.answer_te AS answer_te,
+                       q.explanation_en AS explanation_en,
+                       q.explanation_te AS explanation_te,
                        q.correct_option AS correct_option, q.answer AS answer,
                        q.explanation AS explanation, q.citations AS citations,
                        q.entity_name AS entity_name, q.entity_type AS entity_type,
@@ -677,6 +763,11 @@ class KnowledgeGraph:
                       AND NOT q.question IN asked_questions
                       AND NOT q.id IN asked_ids
                     RETURN q.id AS question_id, q.question AS question, q.options AS options,
+                           q.question_en AS question_en, q.question_te AS question_te,
+                           q.options_en AS options_en, q.options_te AS options_te,
+                           q.answer_en AS answer_en, q.answer_te AS answer_te,
+                           q.explanation_en AS explanation_en,
+                           q.explanation_te AS explanation_te,
                            q.correct_option AS correct_option, q.answer AS answer,
                            q.explanation AS explanation, q.citations AS citations,
                            q.entity_name AS entity_name, q.entity_type AS entity_type,
@@ -719,6 +810,13 @@ class KnowledgeGraph:
         textbook: str,
         entity_name: str | None = None,
         study_question_id: str | None = None,
+        question_te: str | None = None,
+        options_te: list[str] | None = None,
+        explanation_te: str | None = None,
+        etext_en: str = "",
+        etext_te: str = "",
+        summary_en: str = "",
+        summary_te: str = "",
     ) -> None:
         with self.session() as session:
             session.run(
@@ -729,7 +827,13 @@ class KnowledgeGraph:
                     entity_name: coalesce($entity_name, $topic),
                     study_question_id: $study_question_id,
                     question: $question, options: $options,
+                    question_en: $question, question_te: $question_te,
+                    options_en: $options, options_te: $options_te,
                     correct_option: $correct_option, explanation: $explanation,
+                    explanation_en: $explanation,
+                    explanation_te: $explanation_te,
+                    etext_en: $etext_en, etext_te: $etext_te,
+                    summary_en: $summary_en, summary_te: $summary_te,
                     level: $level, textbook: $textbook,
                     attempts_used: 0, resolved: false, created_at: datetime()
                 })
@@ -743,8 +847,15 @@ class KnowledgeGraph:
                 study_question_id=study_question_id,
                 question=question,
                 options=options,
+                question_te=question_te,
+                options_te=options_te,
                 correct_option=correct_option,
                 explanation=explanation,
+                explanation_te=explanation_te,
+                etext_en=etext_en,
+                etext_te=etext_te,
+                summary_en=summary_en,
+                summary_te=summary_te,
                 level=level,
                 textbook=textbook,
             ).consume()
@@ -760,6 +871,28 @@ class KnowledgeGraph:
                 question_id=question_id,
             ).single()
             return result["q"] if result else None
+
+    def save_study_question_translation(
+        self,
+        question_id: str,
+        question_te: str,
+        options_te: list[str],
+        answer_te: str | None,
+        explanation_te: str,
+    ) -> None:
+        with self.session() as session:
+            session.run(
+                """
+                MATCH (q:StudyQuestion {id: $question_id})
+                SET q.question_te = $question_te, q.options_te = $options_te,
+                    q.answer_te = $answer_te, q.explanation_te = $explanation_te
+                """,
+                question_id=question_id,
+                question_te=question_te,
+                options_te=options_te,
+                answer_te=answer_te,
+                explanation_te=explanation_te,
+            ).consume()
 
     def record_screening_attempt(
         self, session_id: str, question_id: str, option_index: int
@@ -818,14 +951,26 @@ class KnowledgeGraph:
         mode: str,
         document_id: str | None,
         citations: list[dict],
+        question_te: str | None = None,
+        options_te: list[str] | None = None,
+        answer_te: str | None = None,
+        explanation_en: str | None = None,
+        explanation_te: str | None = None,
     ) -> None:
         with self.session() as session:
             session.run(
                 """
                 MATCH (s:StudySession {id: $session_id})
                 MERGE (q:StudyQuestion {id: $question_id})
-                SET q.question = $question, q.answer = $answer, q.mode = $mode,
-                    q.options = $options, q.correct_option = $correct_option,
+                SET q.question = $question, q.question_en = $question,
+                    q.question_te = $question_te,
+                    q.answer = $answer, q.answer_en = $answer,
+                    q.answer_te = $answer_te, q.mode = $mode,
+                    q.options = $options, q.options_en = $options,
+                    q.options_te = $options_te,
+                    q.explanation_en = $explanation_en,
+                    q.explanation_te = $explanation_te,
+                    q.correct_option = $correct_option,
                     q.level = $level, q.textbook = $textbook,
                     q.document_id = $document_id, q.citations = $citations,
                     q.liked = coalesce(q.liked, false),
@@ -835,8 +980,13 @@ class KnowledgeGraph:
                 question_id=question_id,
                 session_id=session_id,
                 question=question,
+                question_te=question_te,
                 answer=answer,
+                answer_te=answer_te,
                 options=options,
+                options_te=options_te,
+                explanation_te=explanation_te,
+                explanation_en=explanation_en or answer,
                 correct_option=correct_option,
                 level=level,
                 textbook=textbook,

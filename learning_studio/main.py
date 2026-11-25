@@ -1,10 +1,11 @@
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
-from contextlib import asynccontextmanager
 import json
 import logging
-from pathlib import Path
 import re
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
+from contextlib import asynccontextmanager
+from pathlib import Path
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
@@ -12,29 +13,30 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from neo4j.exceptions import Neo4jError
 
+from .ai import AIExtractionError, AIProvider
 from .config import get_settings
 from .graph import KnowledgeGraph
-from .ai import AIExtractionError, AIProvider
+from .language import is_language_text
 from .models import (
     ChatRequest,
     ChatResponse,
     GraphResponse,
-    QuestionRequest,
-    QuestionResponse,
-    SearchResult,
-    StudySessionRequest,
-    StudySessionResponse,
-    StudyProgress,
     LearningPlanRequest,
     LearningPlanResponse,
     QuestionLikeRequest,
+    QuestionRequest,
+    QuestionResponse,
     ScreeningAttemptRequest,
     ScreeningAttemptResponse,
     ScreeningQuestion,
+    SearchResult,
+    StudyProgress,
+    StudySessionRequest,
+    StudySessionResponse,
+    TranslationRequest,
+    TranslationResponse,
     UploadResponse,
 )
-from .storage import DocumentStorage
-from .tasks import ingest_document
 from .prompts import (
     FALLBACK_CONTEXT,
     FALLBACK_LABEL,
@@ -42,9 +44,346 @@ from .prompts import (
     learning_plan_prompt,
     question_prompt,
 )
+from .storage import DocumentStorage
+from .tasks import ingest_document
+from .tracing import flush_traces
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
+_TELUGU_SCRIPT = re.compile(r"[\u0c00-\u0c7f]")
+
+
+def lesson_paragraphs(value: str) -> list[str]:
+    return [paragraph.strip() for paragraph in re.split(r"\n\s*\n", value.strip()) if paragraph.strip()]
+
+
+def passage_summary_fallback(
+    topic: str, passages: list[dict], related_terms: list[str] | None = None
+) -> tuple[str, str]:
+    source_paragraphs = []
+    for passage in passages:
+        text = str(passage.get("text") or "").replace("●", "\n")
+        for paragraph in re.split(r"\n\s*\n", text):
+            cleaned = re.sub(r"\s+", " ", paragraph).strip(" \t-*•")
+            if cleaned and len(cleaned.split()) >= 5:
+                source_paragraphs.append(cleaned)
+
+    sentences = []
+    for paragraph in source_paragraphs:
+        sentences.extend(
+            sentence.strip()
+            for sentence in re.split(r"(?<=[.!?])\s+", paragraph)
+            if len(sentence.split()) >= 5
+        )
+
+    topic_terms = [
+        topic,
+        *re.findall(r"\(([^)]+)\)", topic),
+        *(related_terms or []),
+    ]
+    topic_matches = [
+        sentence
+        for sentence in sentences
+        if any(
+            term.strip().rstrip(".").casefold() in sentence.casefold()
+            for term in topic_terms
+            if term.strip()
+        )
+    ]
+    ordered_sentences = topic_matches if len(topic_matches) >= 2 else sentences
+    selected = ordered_sentences[:9]
+    if len(selected) >= 4:
+        midpoint = (len(selected) + 1) // 2
+        summary = " ".join(selected[:midpoint]) + "\n\n" + " ".join(selected[midpoint:])
+    elif len(selected) >= 2:
+        summary = " ".join(selected[:1]) + "\n\n" + " ".join(selected[1:])
+    elif source_paragraphs:
+        summary = "\n\n".join(source_paragraphs[:2])
+    else:
+        summary = (
+            f"The indexed textbook passage for {topic} is not available as readable prose. "
+            "Review the source page for the original material."
+        )
+
+    summary_parts = lesson_paragraphs(summary)
+    if len(summary_parts) > 3:
+        summary = "\n\n".join(summary_parts[:3])
+    etext = selected[0] if selected else source_paragraphs[0] if source_paragraphs else summary_parts[0]
+    return etext, summary
+
+
+def related_fact_texts(topic: str, citations: list[dict]) -> list[str]:
+    facts = []
+    seen = set()
+    for citation in citations:
+        if not isinstance(citation, dict):
+            continue
+        related_concepts = citation.get("related_concepts", [])
+        if not isinstance(related_concepts, list):
+            continue
+        for related in related_concepts:
+            if not isinstance(related, dict):
+                continue
+            relationship = str(related.get("relationship") or "").upper()
+            fact = str(related.get("name") or "").strip()
+            if (
+                relationship == "MENTIONS"
+                or not fact
+                or fact.casefold() == topic.casefold()
+                or fact.casefold() in seen
+            ):
+                continue
+            seen.add(fact.casefold())
+            facts.append(fact.rstrip(".") + ".")
+    return facts
+
+
+def related_fact_passages(topic: str, facts: list[str]) -> list[dict]:
+    if not facts:
+        return []
+    return [
+        {
+            "text": f"Indexed textbook facts about {topic}:\n"
+            + "\n".join(f"- {fact}" for fact in facts),
+            "page": "not recorded",
+        }
+    ]
+
+
+def generate_textbook_lesson(
+    provider: AIProvider,
+    topic: str,
+    textbook: str,
+    passages: list[dict],
+    related_terms: list[str] | None = None,
+) -> tuple[str, str, str, str]:
+    source = "\n\n".join(
+        f"Page {item.get('page') or 'not recorded'}: {item['text']}"
+        for item in passages
+    )
+    try:
+        generated = provider.structured_answer(
+            "Prepare clear, connected study material for the requested topic using only "
+            "the supplied textbook passages. Every factual statement must be directly "
+            "supported by those passages. Do not add background knowledge, causes, "
+            "outcomes, benefits, implementation details, examples, or exam advice unless "
+            "the passages explicitly state them. You may reorganize and paraphrase, but "
+            "preserve the source meaning and scope. Do not copy raw fragments or join "
+            "unrelated sentences. "
+            "Return JSON only with exactly four string keys: etext, summary, etext_te, "
+            "and summary_te. "
+            "etext should be a brief, complete introductory paragraph. "
+            "summary must contain exactly 2 or 3 coherent paragraphs, with blank lines "
+            "between paragraphs; aim for 120-180 words only when the source provides "
+            "enough material. Never pad with repeated or unsupported claims. Each "
+            "paragraph should develop a related idea, not be a sentence fragment. "
+            "etext_te and summary_te must accurately translate their English fields "
+            "into natural Telugu using Telugu script. Preserve the same paragraph count "
+            "and blank-line separators in summary_te. "
+            f"Topic: {topic}\nTextbook: {textbook}",
+            source,
+        )
+    except (AIExtractionError, httpx.HTTPError) as exc:
+        logger.warning(
+            "TEXTBOOK_LESSON_GENERATION_FALLBACK topic=%s reason=provider_error error=%s",
+            topic,
+            exc,
+        )
+        etext, summary = passage_summary_fallback(topic, passages, related_terms)
+        return etext, summary, "", ""
+
+    if isinstance(generated, dict):
+        etext = generated.get("etext")
+        summary = generated.get("summary")
+        if (
+            isinstance(etext, str)
+            and etext.strip()
+            and isinstance(summary, str)
+            and len(lesson_paragraphs(summary)) in {2, 3}
+        ):
+            return (
+                etext.strip(),
+                summary.strip(),
+                str(generated.get("etext_te") or "").strip(),
+                str(generated.get("summary_te") or "").strip(),
+            )
+
+    logger.warning(
+        "TEXTBOOK_LESSON_GENERATION_FALLBACK topic=%s reason=invalid_model_output",
+        topic,
+    )
+    etext, summary = passage_summary_fallback(topic, passages, related_terms)
+    return etext, summary, "", ""
+
+
+def bilingual_text_fields(
+    provider: AIProvider,
+    etext_en: str,
+    summary_en: str,
+    etext_te: str = "",
+    summary_te: str = "",
+) -> dict:
+    def valid_telugu(value: str) -> bool:
+        return bool(value) and is_language_text(value, "te") and bool(_TELUGU_SCRIPT.search(value))
+
+    summary_paragraph_count = len(lesson_paragraphs(summary_en))
+    valid_etext_te = valid_telugu(etext_te)
+    valid_summary_te = valid_telugu(summary_te) and (
+        summary_paragraph_count not in {2, 3}
+        or len(lesson_paragraphs(summary_te)) == summary_paragraph_count
+    )
+    if valid_etext_te and valid_summary_te:
+        return {
+            "etext_en": etext_en,
+            "etext_te": etext_te,
+            "summary_en": summary_en,
+            "summary_te": summary_te,
+        }
+
+    try:
+        translated = provider.structured_answer(
+            "Translate the supplied textbook lesson text faithfully into natural Telugu. "
+            "Return JSON only with exactly etext_te and summary_te. "
+            "Use Telugu script. Preserve the same paragraph count and blank-line paragraph "
+            "separators in summary_te. Do not add facts or change the meaning.",
+            json.dumps(
+                {"etext": etext_en, "summary": summary_en},
+                ensure_ascii=False,
+            ),
+        )
+    except (AIExtractionError, httpx.HTTPError) as exc:
+        logger.warning("TELUGU_LESSON_TRANSLATION_FALLBACK reason=provider_error error=%s", exc)
+        translated = {}
+
+    if not isinstance(translated, dict):
+        translated = {}
+    translated_etext = translated.get("etext_te")
+    translated_summary = translated.get("summary_te")
+    valid_translated_etext = valid_telugu(translated_etext)
+    valid_translated_summary = valid_telugu(translated_summary) and (
+        summary_paragraph_count not in {2, 3}
+        or len(lesson_paragraphs(translated_summary)) == summary_paragraph_count
+    )
+    final_etext_te = translated_etext if valid_translated_etext else etext_te if valid_etext_te else ""
+    final_summary_te = (
+        translated_summary
+        if valid_translated_summary
+        else summary_te
+        if valid_summary_te
+        else ""
+    )
+    if not final_etext_te or not final_summary_te:
+        logger.warning(
+            "TELUGU_LESSON_TRANSLATION_PARTIAL etext_valid=%s summary_valid=%s",
+            bool(final_etext_te),
+            bool(final_summary_te),
+        )
+    return {
+        "etext_en": etext_en,
+        "etext_te": final_etext_te.strip(),
+        "summary_en": summary_en,
+        "summary_te": final_summary_te.strip(),
+    }
+
+
+def bilingual_question_fields(
+    provider: AIProvider,
+    question_en: str,
+    options_en: list[str],
+    answer_en: str,
+    explanation_en: str,
+    question_te: str | None = None,
+    options_te: list[str] | None = None,
+    answer_te: str | None = None,
+    explanation_te: str | None = None,
+) -> dict:
+    def valid_telugu(value: str) -> bool:
+        return is_language_text(value, "te") and bool(_TELUGU_SCRIPT.search(value))
+
+    if (
+        isinstance(question_te, str)
+        and valid_telugu(question_te)
+        and isinstance(options_te, list)
+        and len(options_te) == len(options_en)
+        and all(isinstance(item, str) and valid_telugu(item) for item in options_te)
+        and (not explanation_en or isinstance(explanation_te, str) and valid_telugu(explanation_te))
+        and (not answer_en or isinstance(answer_te, str) and valid_telugu(answer_te))
+    ):
+        return {
+            "question_en": question_en,
+            "options_en": options_en,
+            "answer_en": answer_en,
+            "explanation_en": explanation_en,
+            "question_te": question_te,
+            "options_te": options_te,
+            "answer_te": answer_te or "",
+            "explanation_te": explanation_te or "",
+        }
+
+    try:
+        translated = provider.structured_answer(
+            "Translate the supplied multiple-choice question faithfully into natural Telugu. "
+            "Return JSON only with exactly question_te, options_te, answer_te, explanation_te. "
+            "Keep all options in the same order and do not change their meaning. "
+            "Use Telugu script for the translated question and choices. Preserve proper names "
+            "and scientific terms accurately; do not add facts. If answer or explanation is "
+            "empty, return an empty string for its translated field.",
+            json.dumps(
+                {
+                    "question": question_en,
+                    "options": options_en,
+                    "answer": answer_en,
+                    "explanation": explanation_en,
+                },
+                ensure_ascii=False,
+            ),
+        )
+    except (AIExtractionError, httpx.HTTPError) as exc:
+        logger.warning("TELUGU_TRANSLATION_FALLBACK reason=provider_error error=%s", exc)
+        translated = {}
+
+    if not isinstance(translated, dict):
+        translated = {}
+    translated_question = translated.get("question_te")
+    translated_options = translated.get("options_te")
+    translated_answer = translated.get("answer_te", "")
+    translated_explanation = translated.get("explanation_te", "")
+    if (
+        not isinstance(translated_question, str)
+        or not valid_telugu(translated_question)
+        or not isinstance(translated_options, list)
+        or len(translated_options) != len(options_en)
+        or not all(isinstance(item, str) and valid_telugu(item) for item in translated_options)
+        or not isinstance(translated_answer, str)
+        or (answer_en and not valid_telugu(translated_answer))
+        or not isinstance(translated_explanation, str)
+        or (explanation_en and not valid_telugu(translated_explanation))
+    ):
+        logger.warning(
+            "TELUGU_TRANSLATION_FALLBACK reason=invalid_response "
+            "question=%r",
+            question_en,
+        )
+        return {
+            "question_en": question_en,
+            "options_en": options_en,
+            "answer_en": answer_en,
+            "explanation_en": explanation_en,
+            "question_te": "",
+            "options_te": [],
+            "answer_te": "",
+            "explanation_te": "",
+        }
+    return {
+        "question_en": question_en,
+        "options_en": options_en,
+        "answer_en": answer_en,
+        "explanation_en": explanation_en,
+        "question_te": translated_question.strip(),
+        "options_te": [item.strip() for item in translated_options],
+        "answer_te": translated_answer.strip(),
+        "explanation_te": translated_explanation.strip(),
+    }
 
 
 @asynccontextmanager
@@ -57,7 +396,10 @@ async def lifespan(_: FastAPI):
             graph.close()
     except Exception as exc:
         logger.warning("Neo4j schema initialization deferred on startup: %s", exc)
-    yield
+    try:
+        yield
+    finally:
+        flush_traces()
 
 
 app = FastAPI(title="Learning Studio", version="0.1.0", lifespan=lifespan)
@@ -79,6 +421,73 @@ def frontend() -> FileResponse:
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.post(f"{settings.api_prefix}/translate", response_model=TranslationResponse)
+def translate_ui_text(request: TranslationRequest) -> dict:
+    if request.target_language == "en":
+        return {"translations": request.texts}
+
+    instruction = (
+        "Translate every string in the supplied JSON array from English to natural "
+        "Telugu (తెలుగు). Preserve names, numbers, percentages, URLs, page numbers, "
+        "punctuation, symbols, icons, and HTML-free formatting. "
+        "Do not add explanations or extra keys. Return a JSON object with a "
+        '\"translations\" array containing exactly one Telugu string for every input '
+        "string, in the same order."
+    )
+    context = json.dumps(request.texts, ensure_ascii=False)
+    try:
+        grok_key = settings.grok_api_key.strip()
+        grok_model = settings.grok_model.strip()
+        if grok_key and grok_model:
+            grok_endpoint = settings.grok_endpoint.strip().rstrip("/")
+            if grok_endpoint.endswith("/chat/completions"):
+                grok_response_endpoint = grok_endpoint
+            elif grok_endpoint.endswith("/v1"):
+                grok_response_endpoint = f"{grok_endpoint}/chat/completions"
+            else:
+                grok_response_endpoint = grok_endpoint
+            grok_response = httpx.post(
+                grok_response_endpoint,
+                headers={"Authorization": f"Bearer {grok_key}"},
+                json={
+                    "model": grok_model,
+                    "temperature": 0,
+                    "messages": [
+                        {"role": "system", "content": "Translate UI text accurately and return JSON only."},
+                        {"role": "user", "content": f"{instruction}\n\n{context}"},
+                    ],
+                    "response_format": {"type": "json_object"},
+                },
+                timeout=60,
+            )
+            grok_response.raise_for_status()
+            grok_answer = grok_response.json()["choices"][0]["message"]["content"]
+            result = json.loads(grok_answer.strip().removeprefix("```json").removesuffix("```").strip())
+        else:
+            result = AIProvider(settings, feature="ui-translation").structured_answer(
+                instruction,
+                context,
+            )
+    except (AIExtractionError, httpx.HTTPError, KeyError, IndexError, json.JSONDecodeError) as exc:
+        try:
+            result = AIProvider(settings, feature="ui-translation").structured_answer(
+                instruction,
+                context,
+            )
+        except (AIExtractionError, httpx.HTTPError, KeyError, IndexError) as exc:
+            raise HTTPException(status_code=502, detail=f"Could not translate UI text: {exc}") from exc
+
+    translations = result.get("translations")
+    if not isinstance(translations, list) or len(translations) != len(request.texts):
+        raise HTTPException(status_code=502, detail="Translation provider returned an invalid result")
+    return {
+        "translations": [
+            translation if isinstance(translation, str) else original
+            for translation, original in zip(translations, request.texts)
+        ]
+    }
 
 
 @app.get(f"{settings.api_prefix}/library")
@@ -121,7 +530,7 @@ def search(q: str, limit: int = 20) -> list[dict]:
     graph = KnowledgeGraph(settings)
     try:
         try:
-            embedding = AIProvider(settings).embed([q])[0]
+            embedding = AIProvider(settings, feature="semantic-search").embed([q])[0]
             vector_results = graph.vector_search(embedding, limit)
         except (AIExtractionError, httpx.HTTPError, KeyError, IndexError, Neo4jError):
             vector_results = []
@@ -235,6 +644,27 @@ def learning_plan(session_id: str, request: LearningPlanRequest) -> LearningPlan
                     correct_option = matched_idx
 
                 explanation = str(db_question.get("explanation") or db_question.get("answer") or "").strip()
+                try:
+                    bilingual = bilingual_question_fields(
+                        AIProvider(
+                            settings,
+                            session_id=session_id,
+                            feature="question-translation",
+                        ),
+                        q_text,
+                        options,
+                        str(db_question.get("answer_en") or db_question.get("answer") or ""),
+                        explanation,
+                        db_question.get("question_te"),
+                        db_question.get("options_te"),
+                        db_question.get("answer_te"),
+                        db_question.get("explanation_te"),
+                    )
+                except (AIExtractionError, httpx.HTTPError) as exc:
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"Could not create the Telugu question translation: {exc}",
+                    ) from exc
                 citations = db_question.get("citations")
                 if not isinstance(citations, list):
                     citations = []
@@ -243,24 +673,39 @@ def learning_plan(session_id: str, request: LearningPlanRequest) -> LearningPlan
                 passages = graph.textbook_passages(textbook, topic=entity_name, limit=2)
                 if not passages and raw_topic and raw_topic != entity_name:
                     passages = graph.textbook_passages(textbook, topic=raw_topic, limit=2)
+                related_facts = related_fact_texts(entity_name, citations)
+                if not passages:
+                    for fact in related_facts:
+                        passages = graph.textbook_passages(textbook, topic=fact, limit=2)
+                        if passages:
+                            break
+                if not passages:
+                    passages = related_fact_passages(entity_name, related_facts)
 
+                etext_te = ""
+                summary_te = ""
                 if passages:
-                    topic_passage = textbook_topic_excerpt(
-                        passages[0]["text"], entity_name, max_words=120
+                    etext, summary, etext_te, summary_te = generate_textbook_lesson(
+                        AIProvider(
+                            settings,
+                            session_id=session_id,
+                            feature="lesson-generation",
+                        ),
+                        entity_name,
+                        textbook,
+                        passages,
+                        related_facts,
                     )
                     etext = redact_quiz_answer(
-                        topic_passage,
+                        etext,
                         options,
                         correct_option,
                     )
                     if not etext:
                         etext = (
-                            f"Review the textbook material related to {entity_name}. "
-                            "Recall its key facts before answering the knowledge check."
+                            f"Review the textbook material about {entity_name} before "
+                            "answering the knowledge check."
                         )
-                    summary = textbook_topic_excerpt(
-                        passages[0]["text"], entity_name, max_words=60
-                    )
                 else:
                     etext = (
                         f"No descriptive passage about {entity_name} was found in "
@@ -268,6 +713,18 @@ def learning_plan(session_id: str, request: LearningPlanRequest) -> LearningPlan
                         "cannot provide a textbook-grounded summary."
                     )
                     summary = "No descriptive textbook passage is indexed for this topic."
+
+                lesson_texts = bilingual_text_fields(
+                    AIProvider(
+                        settings,
+                        session_id=session_id,
+                        feature="lesson-translation",
+                    ),
+                    etext,
+                    summary,
+                    etext_te,
+                    summary_te,
+                )
 
                 # Persist screening question to session and mark as asked
                 screening_question_id = str(uuid.uuid4())
@@ -284,8 +741,26 @@ def learning_plan(session_id: str, request: LearningPlanRequest) -> LearningPlan
                     textbook,
                     entity_name=entity_name,
                     study_question_id=db_question.get("question_id"),
+                    question_te=bilingual["question_te"],
+                    options_te=bilingual["options_te"],
+                    explanation_te=bilingual["explanation_te"],
+                    etext_en=lesson_texts["etext_en"],
+                    etext_te=lesson_texts["etext_te"],
+                    summary_en=lesson_texts["summary_en"],
+                    summary_te=lesson_texts["summary_te"],
                 )
-                if db_question.get("question_id"):
+                if (
+                    db_question.get("question_id")
+                    and bilingual["question_te"]
+                    and len(bilingual["options_te"]) == len(options)
+                ):
+                    graph.save_study_question_translation(
+                        db_question["question_id"],
+                        bilingual["question_te"],
+                        bilingual["options_te"],
+                        bilingual["answer_te"],
+                        bilingual["explanation_te"],
+                    )
                     graph.mark_question_asked(session_id, db_question["question_id"])
                 try:
                     next_question = graph.related_learning_question(
@@ -325,10 +800,18 @@ def learning_plan(session_id: str, request: LearningPlanRequest) -> LearningPlan
                     next_topic=next_topic,
                     etext=etext,
                     summary=summary,
+                    etext_en=lesson_texts["etext_en"],
+                    etext_te=lesson_texts["etext_te"],
+                    summary_en=lesson_texts["summary_en"],
+                    summary_te=lesson_texts["summary_te"],
                     question=ScreeningQuestion(
                         question_id=screening_question_id,
                         question=q_text,
                         options=options,
+                        question_en=bilingual["question_en"],
+                        question_te=bilingual["question_te"],
+                        options_en=bilingual["options_en"],
+                        options_te=bilingual["options_te"],
                     ),
                     citations=citations,
                     source="textbook",
@@ -414,7 +897,11 @@ def learning_plan(session_id: str, request: LearningPlanRequest) -> LearningPlan
             passages=ground_truth,
             fallback=not ground_truth,
         )
-        provider = AIProvider(settings)
+        provider = AIProvider(
+            settings,
+            session_id=session_id,
+            feature="learning-plan",
+        )
         try:
             generated = provider.structured_answer(
                 instruction + (
@@ -439,30 +926,119 @@ def learning_plan(session_id: str, request: LearningPlanRequest) -> LearningPlan
             raise HTTPException(status_code=502, detail="AI returned an invalid screening question")
         if not 0 <= correct_option < len(options):
             raise HTTPException(status_code=502, detail="AI returned an invalid answer index")
+        options = [str(option).strip() for option in options]
+        question_text = question_text.strip()
+        explanation = str(generated.get("explanation", "")).strip()
+        generated_etext = str(generated.get("etext", "")).strip()
+        generated_summary = str(generated.get("summary", "")).strip()
+        if len(lesson_paragraphs(generated_summary)) not in {2, 3}:
+            logger.warning(
+                "LEARNING_PLAN_SUMMARY_FALLBACK session=%s topic=%s reason=invalid_model_output",
+                session_id,
+                topic,
+            )
+            if passages:
+                fallback_etext, generated_summary = passage_summary_fallback(topic, passages)
+                generated_etext = generated_etext or fallback_etext
+            else:
+                generated_etext = (
+                    f"No descriptive textbook passage is indexed for {topic or 'this topic'}."
+                )
+                generated_summary = (
+                    generated_etext
+                    + "\n\nThe available index does not contain enough source material "
+                    "to produce a textbook-grounded summary."
+                )
+        generated_options_te = generated.get("options_te")
+        generated_answer_te = None
+        if (
+            isinstance(generated_options_te, list)
+            and len(generated_options_te) == len(options)
+            and all(isinstance(option, str) for option in generated_options_te)
+        ):
+            generated_answer_te = (
+                f"{generated_options_te[correct_option]}. "
+                f"{generated.get('explanation_te', '')}"
+            ).strip()
+        try:
+            bilingual = bilingual_question_fields(
+                AIProvider(
+                    settings,
+                    session_id=session_id,
+                    feature="question-translation",
+                ),
+                question_text,
+                options,
+                f"{options[correct_option]}. {explanation}".strip(),
+                explanation,
+                generated.get("question_te"),
+                generated_options_te,
+                generated_answer_te,
+                generated.get("explanation_te"),
+            )
+        except (AIExtractionError, httpx.HTTPError) as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Could not create the Telugu question translation: {exc}",
+            ) from exc
+        lesson_texts = bilingual_text_fields(
+            AIProvider(
+                settings,
+                session_id=session_id,
+                feature="lesson-translation",
+            ),
+            generated_etext,
+            generated_summary,
+            generated.get("etext_te", ""),
+            generated.get("summary_te", ""),
+        )
         question_id = str(uuid.uuid4())
         graph.save_learning_question(
             question_id,
             session_id,
             request.topic,
             request.mode,
-            question_text.strip(),
-            [str(option) for option in options],
+            question_text,
+            options,
             correct_option,
-            str(generated.get("explanation", "")),
+            explanation,
             settings.question_level,
             session_context["textbook"],
             entity_name=request.topic,
+            question_te=bilingual["question_te"],
+            options_te=bilingual["options_te"],
+            explanation_te=bilingual["explanation_te"],
+            etext_en=lesson_texts["etext_en"],
+            etext_te=lesson_texts["etext_te"],
+            summary_en=lesson_texts["summary_en"],
+            summary_te=lesson_texts["summary_te"],
         )
         return LearningPlanResponse(
             session_id=session_id,
             mode=request.mode,
             topic=topic or session_context["textbook"],
-            etext=str(generated.get("etext", "")),
-            summary=str(generated.get("summary", "")),
+            etext=(
+                lesson_texts["etext_te"]
+                if request.language == "te" and lesson_texts["etext_te"]
+                else lesson_texts["etext_en"]
+            ),
+            summary=(
+                lesson_texts["summary_te"]
+                if request.language == "te" and lesson_texts["summary_te"]
+                else lesson_texts["summary_en"]
+            ),
+            etext_en=lesson_texts["etext_en"],
+            etext_te=lesson_texts["etext_te"],
+            summary_en=lesson_texts["summary_en"],
+            summary_te=lesson_texts["summary_te"],
             question=ScreeningQuestion(
                 question_id=question_id,
-                question=question_text.strip(),
-                options=[str(option) for option in options],
+                question=question_text,
+                options=options,
+                question_en=bilingual["question_en"],
+                question_te=bilingual["question_te"],
+                options_en=bilingual["options_en"],
+                options_te=bilingual["options_te"],
             ),
             citations=citations,
             source=source,
@@ -487,15 +1063,41 @@ def screening_attempt(
         if request.option_index >= len(options):
             raise HTTPException(status_code=400, detail="Invalid option index")
         attempts_used = int(question["attempts_used"])
+        explanation_en = str(
+            question.get("explanation_en") or question.get("explanation") or ""
+        ).strip()
+        explanation_te = str(
+            question.get("explanation_te") or ""
+        ).strip()
+
+        def feedback_text(correct: bool, revealed: bool) -> tuple[str, str]:
+            if correct:
+                return "Correct! Great job.", "సరైన సమాధానం! బాగా చేశారు."
+            if not revealed:
+                return (
+                    "Incorrect. Try again (1 attempt remaining).",
+                    "సమాధానం తప్పు. మళ్లీ ప్రయత్నించండి (ఇంకా 1 ప్రయత్నం ఉంది).",
+                )
+            letter = chr(65 + int(question["correct_option"]))
+            return (
+                f"Two incorrect attempts. The correct answer was Option {letter}. "
+                f"{explanation_en}",
+                f"రెండు ప్రయత్నాలు తప్పాయి. సరైన సమాధానం ఎంపిక {letter}. "
+                f"{explanation_te}",
+            )
+
         if attempts_used >= 2 or question.get("resolved", False):
             is_correct = request.option_index == int(question["correct_option"])
+            feedback_en, feedback_te = feedback_text(is_correct, True)
             return ScreeningAttemptResponse(
                 correct=is_correct,
                 attempts_used=attempts_used,
                 attempts_remaining=0,
                 answer_revealed=True,
                 correct_option_index=int(question["correct_option"]),
-                feedback=str(question["explanation"]),
+                feedback=feedback_te if request.language == "te" else feedback_en,
+                feedback_en=feedback_en,
+                feedback_te=feedback_te,
                 progress=min(100, attempts_used * 10),
             )
         question = graph.record_screening_attempt(session_id, question_id, request.option_index)
@@ -504,14 +1106,7 @@ def screening_attempt(
         is_correct = request.option_index == int(question["correct_option"])
         attempts_used = int(question["attempts_used"])
         revealed = is_correct or attempts_used >= 2
-        if is_correct:
-            feedback = "Correct! Great job."
-        elif revealed:
-            correct_letter = chr(65 + int(question["correct_option"]))
-            explanation = str(question.get("explanation", "")).strip()
-            feedback = f"Two incorrect attempts. The correct answer was Option {correct_letter}. {explanation}"
-        else:
-            feedback = "Incorrect. Try again (1 attempt remaining)."
+        feedback_en, feedback_te = feedback_text(is_correct, revealed)
 
         return ScreeningAttemptResponse(
             correct=is_correct,
@@ -519,7 +1114,9 @@ def screening_attempt(
             attempts_remaining=max(0, 2 - attempts_used),
             answer_revealed=revealed,
             correct_option_index=int(question["correct_option"]) if revealed else None,
-            feedback=feedback,
+            feedback=feedback_te if request.language == "te" else feedback_en,
+            feedback_en=feedback_en,
+            feedback_te=feedback_te,
             progress=min(100, attempts_used * 10 + (50 if is_correct else 0)),
         )
     finally:
@@ -780,7 +1377,11 @@ def chat(session_id: str, request: ChatRequest) -> ChatResponse:
                 "details as facts found in the textbook."
             )
             try:
-                answer = AIProvider(settings).gemini_search_answer(
+                answer = AIProvider(
+                    settings,
+                    session_id=session_id,
+                    feature="chat",
+                ).gemini_search_answer(
                     search_instruction,
                     context,
                     timeout_seconds=settings.chat_fallback_timeout_seconds,
@@ -806,7 +1407,11 @@ def chat(session_id: str, request: ChatRequest) -> ChatResponse:
                 settings.providers,
             )
             try:
-                answer = AIProvider(settings).answer(
+                answer = AIProvider(
+                    settings,
+                    session_id=session_id,
+                    feature="chat",
+                ).answer(
                     instruction,
                     context,
                     timeout_seconds=min(float(settings.question_generation_timeout_seconds), 4.0),
@@ -842,15 +1447,97 @@ def play_question(session_id: str, request: QuestionRequest) -> QuestionResponse
             raise HTTPException(status_code=404, detail="Study session not found")
         if request.mode in {"previous", "textbook"}:
             bank = graph.question_bank(
-                session_id, request.mode, settings.question_level, session_context["textbook"]
+                session_id,
+                request.mode,
+                settings.question_level,
+                session_context["textbook"],
+                language=request.language,
             )
             if bank:
                 item = bank[0]
+                question_en = str(
+                    item.get("question_en") or item.get("question") or ""
+                ).strip()
+                raw_options_en = item.get("options_en") or item.get("options") or []
+                options_en = (
+                    [str(option).strip() for option in raw_options_en]
+                    if isinstance(raw_options_en, (list, tuple))
+                    else []
+                )
+                answer_en = str(
+                    item.get("answer_en") or item.get("answer") or ""
+                ).strip()
+                bilingual = {
+                    "question_en": question_en,
+                    "options_en": options_en,
+                    "answer_en": answer_en,
+                    "question_te": item.get("question_te"),
+                    "options_te": item.get("options_te"),
+                    "answer_te": item.get("answer_te"),
+                    "explanation_en": str(
+                        item.get("explanation_en") or item.get("explanation") or ""
+                    ),
+                    "explanation_te": item.get("explanation_te"),
+                }
+                if request.mode == "textbook":
+                    try:
+                        bilingual = bilingual_question_fields(
+                            AIProvider(
+                                settings,
+                                session_id=session_id,
+                                feature="question-translation",
+                            ),
+                            question_en,
+                            options_en,
+                            answer_en,
+                            bilingual["explanation_en"],
+                            item.get("question_te"),
+                            item.get("options_te"),
+                            item.get("answer_te"),
+                            item.get("explanation_te"),
+                        )
+                    except (AIExtractionError, httpx.HTTPError) as exc:
+                        raise HTTPException(
+                            status_code=502,
+                            detail=f"Could not create the Telugu question translation: {exc}",
+                        ) from exc
+                    if (
+                        bilingual["question_te"]
+                        and len(bilingual["options_te"]) == len(options_en)
+                    ):
+                        graph.save_study_question_translation(
+                            item["question_id"],
+                            bilingual["question_te"],
+                            bilingual["options_te"],
+                            bilingual["answer_te"],
+                            bilingual["explanation_te"],
+                        )
+                question = (
+                    bilingual["question_te"]
+                    if request.language == "te"
+                    else bilingual["question_en"]
+                )
+                options = (
+                    bilingual["options_te"]
+                    if request.language == "te"
+                    else bilingual["options_en"]
+                )
+                answer = (
+                    bilingual["answer_te"]
+                    if request.language == "te"
+                    else bilingual["answer_en"]
+                )
                 return QuestionResponse(
                     question_id=str(uuid.uuid4()),
-                    question=item["question"],
-                    options=item["options"],
-                    answer=item.get("answer"),
+                    question=question,
+                    options=options,
+                    answer=answer,
+                    question_en=bilingual["question_en"],
+                    question_te=bilingual["question_te"],
+                    options_en=bilingual["options_en"],
+                    options_te=bilingual["options_te"],
+                    answer_en=bilingual["answer_en"],
+                    answer_te=bilingual["answer_te"],
                     mode=request.mode,
                     citations=item["citations"],
                     liked=bool(item.get("liked", False)),
@@ -915,7 +1602,13 @@ def play_question(session_id: str, request: QuestionRequest) -> QuestionResponse
                     session_id, session_context["textbook"], settings.providers)
         executor = ThreadPoolExecutor(max_workers=1)
         future = executor.submit(
-            AIProvider(settings).structured_answer, instruction, f"{context}\n{prior}"
+            AIProvider(
+                settings,
+                session_id=session_id,
+                feature="question-generation",
+            ).structured_answer,
+            instruction,
+            f"{context}\n{prior}",
         )
         try:
             generated = future.result(timeout=settings.question_generation_timeout_seconds)
@@ -977,6 +1670,38 @@ def play_question(session_id: str, request: QuestionRequest) -> QuestionResponse
             raise HTTPException(status_code=502, detail="AI returned an invalid MCQ")
         options = [option.strip() for option in options]
         answer = f"{options[correct_option]}. {explanation}".strip()
+        generated_options_te = generated.get("options_te")
+        generated_answer_te = None
+        if (
+            isinstance(generated_options_te, list)
+            and len(generated_options_te) == len(options)
+            and all(isinstance(option, str) for option in generated_options_te)
+        ):
+            generated_answer_te = (
+                f"{generated_options_te[correct_option]}. "
+                f"{generated.get('explanation_te', '')}"
+            ).strip()
+        try:
+            bilingual = bilingual_question_fields(
+                AIProvider(
+                    settings,
+                    session_id=session_id,
+                    feature="question-translation",
+                ),
+                question.strip(),
+                options,
+                answer,
+                str(explanation),
+                generated.get("question_te"),
+                generated_options_te,
+                generated_answer_te,
+                generated.get("explanation_te"),
+            )
+        except (AIExtractionError, httpx.HTTPError) as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Could not create the Telugu question translation: {exc}",
+            ) from exc
         question_id = str(uuid.uuid4())
         graph.save_question(
             question_id,
@@ -990,12 +1715,35 @@ def play_question(session_id: str, request: QuestionRequest) -> QuestionResponse
             request.mode,
             request.document_id,
             context_items,
+            question_te=bilingual["question_te"],
+            options_te=bilingual["options_te"],
+            answer_te=bilingual["answer_te"],
+            explanation_en=str(explanation),
+            explanation_te=bilingual["explanation_te"],
         )
         return QuestionResponse(
             question_id=question_id,
-            question=question.strip(),
-            options=options,
-            answer=answer,
+            question=(
+                bilingual["question_te"]
+                if request.language == "te"
+                else bilingual["question_en"]
+            ),
+            options=(
+                bilingual["options_te"]
+                if request.language == "te"
+                else bilingual["options_en"]
+            ),
+            answer=(
+                bilingual["answer_te"]
+                if request.language == "te"
+                else bilingual["answer_en"]
+            ),
+            question_en=bilingual["question_en"],
+            question_te=bilingual["question_te"],
+            options_en=bilingual["options_en"],
+            options_te=bilingual["options_te"],
+            answer_en=bilingual["answer_en"],
+            answer_te=bilingual["answer_te"],
             mode=request.mode,
             citations=context_items,
             liked=False,

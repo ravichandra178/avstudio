@@ -45,6 +45,15 @@ class StudyProgress(BaseModel):
     percent: int
 
 
+class TranslationRequest(BaseModel):
+    texts: list[str] = Field(min_length=1, max_length=80)
+    target_language: str = Field(default="te", pattern="^(te|en)$")
+
+
+class TranslationResponse(BaseModel):
+    translations: list[str]
+
+
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
     document_id: str | None = None
@@ -71,6 +80,12 @@ class QuestionResponse(BaseModel):
     question: str
     options: list[str] = Field(min_length=2, max_length=6)
     answer: str | None = None
+    question_en: str | None = None
+    question_te: str | None = None
+    options_en: list[str] | None = None
+    options_te: list[str] | None = None
+    answer_en: str | None = None
+    answer_te: str | None = None
     mode: str
     citations: list[dict] = Field(default_factory=list)
     liked: bool = False
@@ -91,6 +106,10 @@ class ScreeningQuestion(BaseModel):
     question_id: str
     question: str
     options: list[str] = Field(min_length=2, max_length=6)
+    question_en: str
+    question_te: str = ""
+    options_en: list[str] = Field(min_length=2, max_length=6)
+    options_te: list[str] = Field(default_factory=list, max_length=6)
     attempts_used: int = 0
     max_attempts: int = 3
 
@@ -102,6 +121,10 @@ class LearningPlanResponse(BaseModel):
     next_topic: str | None = None
     etext: str
     summary: str
+    etext_en: str
+    etext_te: str = ""
+    summary_en: str
+    summary_te: str = ""
     question: ScreeningQuestion
     citations: list[dict] = Field(default_factory=list)
     source: str
@@ -109,6 +132,7 @@ class LearningPlanResponse(BaseModel):
 
 class ScreeningAttemptRequest(BaseModel):
     option_index: int = Field(ge=0, le=5)
+    language: str = Field(default="en", pattern="^(en|te)$")
 
 
 class ScreeningAttemptResponse(BaseModel):
@@ -118,4 +142,6 @@ class ScreeningAttemptResponse(BaseModel):
     answer_revealed: bool
     correct_option_index: int | None = None
     feedback: str
+    feedback_en: str
+    feedback_te: str
     progress: int

@@ -4,14 +4,14 @@ import httpx
 from dotenv import load_dotenv
 
 load_dotenv()
-groq_api_key = os.getenv("GROQ_API_KEY")
+groq_api_key = os.getenv("GROK_API_KEY")
 if not groq_api_key:
     raise RuntimeError("GROQ_API_KEY is missing; set it in .env or export it in your shell.")
 
 endpoint = os.getenv(
     "GROQ_ENDPOINT", "https://api.groq.com/openai/v1/chat/completions"
 )
-model = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
+model = os.getenv("GROK_MODEL", "openai/gpt-oss-20b")
 
 response = httpx.post(
     endpoint,

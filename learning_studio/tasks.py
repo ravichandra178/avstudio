@@ -7,6 +7,7 @@ from .ai import AIExtractionError, AIProvider
 from .config import get_settings
 from .graph import KnowledgeGraph
 from .storage import DocumentStorage
+from .tracing import flush_traces, trace_operation, update_operation
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,24 @@ except ImportError:
 
 @task_decorator
 def ingest_document(document_id: str, filename: str, storage_key: str) -> None:
+    with trace_operation(
+        "ingest-document",
+        feature="document-ingestion",
+        input={"document_id": document_id, "filename": filename},
+        metadata={"document_id": document_id, "filename": filename},
+    ) as observation:
+        try:
+            _ingest_document(document_id, filename, storage_key)
+            update_operation(
+                observation,
+                output={"status": "completed"},
+                summary={"status": "completed"},
+            )
+        finally:
+            flush_traces()
+
+
+def _ingest_document(document_id: str, filename: str, storage_key: str) -> None:
     settings = get_settings()
     storage = DocumentStorage(settings)
     graph = KnowledgeGraph(settings)
@@ -54,12 +73,17 @@ def ingest_document(document_id: str, filename: str, storage_key: str) -> None:
             if page_text:
                 chunks.append({"id": f"{document_id}-{index}", "page": index + 1, "text": page_text})
         text = "\n".join(chunk["text"] for chunk in chunks)
-        concepts = AIProvider(settings).extract(text, document_id)
+        concepts = AIProvider(settings, feature="document-ingestion").extract(
+            text, document_id
+        )
         graph.save_concepts(document_id, concepts)
         if chunks:
             try:
                 graph.ensure_vector_index(settings.embedding_dimensions)
-                embeddings = AIProvider(settings).embed([chunk["text"] for chunk in chunks])
+                embeddings = AIProvider(
+                    settings,
+                    feature="document-ingestion",
+                ).embed([chunk["text"] for chunk in chunks])
                 graph.save_chunks(document_id, chunks, embeddings)
             except AIExtractionError:
                 logger.warning("Vector indexing skipped for %s; embedding provider is not configured", document_id)
